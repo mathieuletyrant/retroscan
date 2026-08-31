@@ -108,18 +108,15 @@ func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?) throw
             let sam = encodedSAM(sam, image)
             return regions.compactMap { cropRegion(image, $0, background: background, sam: sam) }
         }
-        // A single region is either a lone photo or a document.
-        if let region = regions.first {
-            let wholePage = Double(region.width * region.height)
-                > Double(image.width * image.height) * 0.9
-            if !wholePage, let sam = encodedSAM(sam, image),
-               let refined = try? sam.refine(region: region),
-               let cropped = image.cropping(to: tightenRect(image, refined, background: background)) {
-                return [CroppedImage(image: cropped, method: "photo (SAM)")]
-            }
-            if let snapped = snapToRectangle(image, around: region) {
-                return [CroppedImage(image: snapped, method: "photo (edges)")]
-            }
+        // A lone region that isn't the whole page is a single photo: give it
+        // the same treatment as one photo among several. (A region covering
+        // ~everything is an already-cropped image; leave it to the document
+        // and trim fallbacks.)
+        if let region = regions.first,
+           Double(region.width * region.height) < Double(image.width * image.height) * 0.9,
+           let cropped = cropRegion(image, region, background: background,
+                                    sam: encodedSAM(sam, image)) {
+            return [cropped]
         }
         if let doc = detectAndCropDocument(image) {
             return [CroppedImage(image: doc, method: "document")]
