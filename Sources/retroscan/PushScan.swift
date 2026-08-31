@@ -16,8 +16,11 @@ final class PushScanListener {
     private var lastTrigger = ""
     private var lastTriggerTime = Date.distantPast
 
+    // 54925 is not just a convention: at least the MFC-1910W sends its
+    // button notifications there regardless of the port advertised in the
+    // registration's HOST= field.
     init(printerHost: String, localIP: String, displayName: String,
-         listenPort: UInt16 = 54926) {
+         listenPort: UInt16 = 54925) {
         self.printerHost = printerHost
         self.localIP = localIP
         self.displayName = displayName
@@ -45,7 +48,9 @@ final class PushScanListener {
             }
         }
         guard bound == 0 else {
-            throw ScanError.connectionFailed("cannot bind UDP port \(listenPort)")
+            throw ScanError.connectionFailed(
+                "cannot bind UDP port \(listenPort) — Brother's NETserver probably holds it; "
+                + "stop it with: pkill -x NETserver")
         }
         // recvfrom wakes up regularly so the registration can be refreshed.
         var tv = timeval(tv_sec: 50, tv_usec: 0)
@@ -57,6 +62,11 @@ final class PushScanListener {
     /// Re-registers whenever the wait times out.
     func waitForButton() throws {
         var buffer = [UInt8](repeating: 0, count: 2048)
+
+        // The device retransmits each press for a while; anything that piled
+        // up during the previous scan is stale — drop it before listening.
+        while recv(socketFD, &buffer, buffer.count, MSG_DONTWAIT) > 0 {}
+
         while true {
             let n = recv(socketFD, &buffer, buffer.count, 0)
             if n <= 0 {
@@ -75,9 +85,11 @@ final class PushScanListener {
             }
             guard fields["USER"] == displayName else { continue }
 
-            // The device retransmits each press several times (same SEQ).
+            // The device retransmits each press several times with the same
+            // SEQ; a genuinely new press increments it. The generous window
+            // only guards against counter reuse after a device reboot.
             let trigger = "\(fields["REGID"] ?? "")/\(fields["SEQ"] ?? "")"
-            if trigger == lastTrigger && Date().timeIntervalSince(lastTriggerTime) < 15 {
+            if trigger == lastTrigger && Date().timeIntervalSince(lastTriggerTime) < 600 {
                 continue
             }
             lastTrigger = trigger

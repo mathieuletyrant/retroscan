@@ -58,6 +58,13 @@ lay photos on the glass → press the printer's **Scan** button → pick
 *retroscan* on its LCD → files appear on the Mac, numbered in sequence.
 You never touch the computer during a scanning session.
 
+⚠️ If Brother's driver package is installed, its `NETserver` daemon squats
+UDP port 54925 — where the device actually sends its button notifications,
+whatever port you advertise. retroscan will tell you; free the port with
+`pkill -x NETserver` (it comes back at next login via the
+`com.brother.LOGINserver` launch agent — remove that from
+`/Library/LaunchAgents/` for a permanent fix).
+
 ## ✂️ What `auto` cropping does
 
 1. Several photos on the bed → region detection (luminance + gradient

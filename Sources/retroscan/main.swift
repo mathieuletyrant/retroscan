@@ -394,7 +394,7 @@ if opts.watch {
         fail("\(error)")
     }
     print("Registered on \(modelName ?? printerIP) as \"retroscan\".")
-    print("Press the device's Scan button and pick Scan to PC > retroscan. Ctrl+C to quit.")
+    print("Press the device's Scan button > Scan to PC > Image and confirm. Ctrl+C to quit.")
     while true {
         do {
             try listener.waitForButton()
