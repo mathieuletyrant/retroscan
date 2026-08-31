@@ -89,9 +89,9 @@ func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage]
         return [CroppedImage(image: image, method: "none")]
 
     case .photos:
-        let regions = detectContentRegions(image)
+        let (regions, background) = detectContentRegions(image)
         if !regions.isEmpty {
-            return regions.compactMap { cropRegion(image, $0) }
+            return regions.compactMap { cropRegion(image, $0, background: background) }
         }
         return [CroppedImage(image: image, method: "none")]
 
@@ -102,9 +102,9 @@ func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage]
         return [CroppedImage(image: image, method: "none")]
 
     case .auto:
-        let regions = detectContentRegions(image)
+        let (regions, background) = detectContentRegions(image)
         if regions.count >= 2 {
-            return regions.compactMap { cropRegion(image, $0) }
+            return regions.compactMap { cropRegion(image, $0, background: background) }
         }
         // A single region is either a lone photo or a document: try the
         // photo rectangle snap first, then document segmentation.
@@ -156,15 +156,55 @@ private struct Mask {
     let height: Int
 }
 
-/// Downscaled thresholded view of the page: true where the pixel is not
-/// scanner-bed white. Two signals are combined, because luminance alone
-/// cannot tell a washed-out photo sky (which can scan at 246+) from the bed:
-///  - luminance: bed scans near-pure white (≥250), so anything below
-///    `threshold` is content;
-///  - gradient: the bed is perfectly flat while a print's edge is always a
+/// Estimates the scan background level. White bed with the lid closed reads
+/// 250+; a dark backing sheet laid over the photos reads much lower. Prints
+/// often touch several edges of the scan area, so each side is measured
+/// separately: the background only has to show on one of them.
+private func backgroundLevel(_ pixels: UnsafeMutablePointer<UInt8>, _ sw: Int, _ sh: Int) -> Int {
+    let border = max(1, min(sw, sh) / 50)
+    var sides: [[UInt8]] = [[], [], [], []]
+    for y in 0..<sh {
+        for x in 0..<sw {
+            let v = pixels[y * sw + x]
+            if y < border { sides[0].append(v) }
+            if y >= sh - border { sides[1].append(v) }
+            if x < border { sides[2].append(v) }
+            if x >= sw - border { sides[3].append(v) }
+        }
+    }
+    var medians: [Int] = []
+    var spreads: [Int] = []
+    for i in sides.indices {
+        sides[i].sort()
+        let side = sides[i]
+        guard !side.isEmpty else { continue }
+        medians.append(Int(side[side.count / 2]))
+        spreads.append(Int(side[side.count * 3 / 4]) - Int(side[side.count / 4]))
+    }
+    guard let brightest = medians.max() else { return 255 }
+    // Any side that reads near-white is bare bed.
+    if brightest >= 244 { return brightest }
+    // No white side: a deliberate dark backing sheet shows on some side as a
+    // band that is both uniform and truly dark. Anything else (e.g. photo
+    // content touching every edge of an already-cropped image) is treated
+    // as white bed.
+    let flattest = spreads.firstIndex(of: spreads.min()!) ?? 0
+    let level = medians[flattest]
+    return (spreads[flattest] <= 10 && level < 160) ? level : 255
+}
+
+/// Downscaled thresholded view of the page: true where the pixel is not scan
+/// background. The background level is measured from the page frame, so a
+/// dark backing sheet laid over the photos works as well as the bare white
+/// bed. Two signals are combined, because luminance alone cannot tell a
+/// washed-out photo sky (which can scan at 246+) from a white bed:
+///  - luminance: far enough from the background level is content
+///    (against a white bed that means below `threshold`);
+///  - gradient: the background is flat while a print's edge is always a
 ///    luminance step, so any local step > `gradientThreshold` is content too.
 private func contentMask(_ image: CGImage, maxDim: Int, threshold: UInt8,
-                         gradientThreshold: Int = 3) -> (Mask, Double)? {
+                         gradientThreshold: Int = 3,
+                         background backgroundOverride: Int? = nil) -> (Mask, Double, Int)? {
     let scale = min(1.0, Double(maxDim) / Double(max(image.width, image.height)))
     let sw = max(1, Int(Double(image.width) * scale))
     let sh = max(1, Int(Double(image.height) * scale))
@@ -176,11 +216,21 @@ private func contentMask(_ image: CGImage, maxDim: Int, threshold: UInt8,
     ctx.draw(image, in: CGRect(x: 0, y: 0, width: sw, height: sh))
     guard let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
 
+    // Measured once per page and passed down to region-level calls, where
+    // the crop's own frame would mostly sample photo, not background.
+    let background = backgroundOverride ?? backgroundLevel(pixels, sw, sh)
+    let whiteBed = background >= 244
+
     var bits = [Bool](repeating: false, count: sw * sh)
     for y in 0..<sh {
         for x in 0..<sw {
             let i = y * sw + x
             let v = Int(pixels[i])
+            if !whiteBed {
+                // Dark/colored backing: photos are far lighter than it.
+                if abs(v - background) > 18 { bits[i] = true }
+                continue
+            }
             // The gradient spans two pixels because downscaling smears a
             // print edge's step across neighbours.
             if v < Int(threshold) {
@@ -192,7 +242,7 @@ private func contentMask(_ image: CGImage, maxDim: Int, threshold: UInt8,
             }
         }
     }
-    return (Mask(bits: bits, width: sw, height: sh), scale)
+    return (Mask(bits: bits, width: sw, height: sh), scale, background)
 }
 
 /// Bridges small gaps (photo borders, faint edges) so each photo labels as
@@ -218,8 +268,10 @@ private func dilate(_ mask: Mask, radius: Int) -> Mask {
 
 /// Finds bounding boxes (in full-resolution pixels) of distinct content
 /// regions large enough to be photos/documents.
-private func detectContentRegions(_ image: CGImage) -> [CGRect] {
-    guard let (rawMask, scale) = contentMask(image, maxDim: 600, threshold: 246) else { return [] }
+private func detectContentRegions(_ image: CGImage) -> (regions: [CGRect], background: Int) {
+    guard let (rawMask, scale, background) = contentMask(image, maxDim: 600, threshold: 246) else {
+        return ([], 255)
+    }
     let mask = dilate(rawMask, radius: 2)
     let w = mask.width, h = mask.height
 
@@ -287,14 +339,21 @@ private func detectContentRegions(_ image: CGImage) -> [CGRect] {
     }
 
     // Prints laid almost touching on the glass can merge into one region;
-    // split any region crossed by a narrow all-white seam.
-    rects = rects.flatMap { splitMergedPhotos(image, $0) }
+    // split any region crossed by a narrow all-background seam.
+    rects = rects.flatMap { splitMergedPhotos(image, $0, background: background) }
         .filter { min($0.width, $0.height) >= Double(minSide) * inv }
 
     // Top-to-bottom, left-to-right output order.
-    return rects.sorted {
+    let sorted = rects.sorted {
         abs($0.minY - $1.minY) > 20 ? $0.minY < $1.minY : $0.minX < $1.minX
     }
+    if ProcessInfo.processInfo.environment["RETROSCAN_DEBUG"] != nil {
+        let rectsText = sorted.map { "(\(Int($0.minX)),\(Int($0.minY)) \(Int($0.width))×\(Int($0.height)))" }
+            .joined(separator: " ")
+        FileHandle.standardError.write(Data(
+            "debug: background=\(background) components=\(boxes.count) regions=\(sorted.count) \(rectsText)\n".utf8))
+    }
+    return (sorted, background)
 }
 
 // MARK: - Seam split (photos touching on the glass)
@@ -303,7 +362,8 @@ private func detectContentRegions(_ image: CGImage) -> [CGRect] {
 /// across it — the gap between two prints laid too close together. A pale
 /// area inside one photo never qualifies: it would have to be a full-length,
 /// nearly pure-white stripe thinner than 4% of the region.
-private func splitMergedPhotos(_ image: CGImage, _ rect: CGRect, depth: Int = 0) -> [CGRect] {
+private func splitMergedPhotos(_ image: CGImage, _ rect: CGRect, background: Int,
+                               depth: Int = 0) -> [CGRect] {
     guard depth < 3, rect.width > 80, rect.height > 80,
           let region = image.cropping(to: rect) else { return [rect] }
 
@@ -317,15 +377,20 @@ private func splitMergedPhotos(_ image: CGImage, _ rect: CGRect, depth: Int = 0)
           case _ = ctx.draw(region, in: CGRect(x: 0, y: 0, width: sw, height: sh)),
           let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return [rect] }
 
-    // Fraction of near-bed-white pixels per column/row.
+    // Fraction of background-level pixels per column/row. Pure white always
+    // counts as seam material: even over a dark backing, a strip of bare bed
+    // white between two prints is a gap, never photo content.
+    func isBackground(_ v: UInt8) -> Bool {
+        v >= 248 || abs(Int(v) - background) <= 10
+    }
     func whiteFraction(column x: Int) -> Double {
         var white = 0
-        for y in 0..<sh where pixels[y * sw + x] >= 248 { white += 1 }
+        for y in 0..<sh where isBackground(pixels[y * sw + x]) { white += 1 }
         return Double(white) / Double(sh)
     }
     func whiteFraction(row y: Int) -> Double {
         var white = 0
-        for x in 0..<sw where pixels[y * sw + x] >= 248 { white += 1 }
+        for x in 0..<sw where isBackground(pixels[y * sw + x]) { white += 1 }
         return Double(white) / Double(sw)
     }
 
@@ -354,8 +419,8 @@ private func splitMergedPhotos(_ image: CGImage, _ rect: CGRect, depth: Int = 0)
             if width <= maxSeamWidth && j < span - minSide {
                 let cut = Double(i + j + 1) / 2 * inv
                 let (a, b) = makeRects(cut)
-                return splitMergedPhotos(image, a, depth: depth + 1)
-                    + splitMergedPhotos(image, b, depth: depth + 1)
+                return splitMergedPhotos(image, a, background: background, depth: depth + 1)
+                    + splitMergedPhotos(image, b, background: background, depth: depth + 1)
             }
             i = j + 1
         }
@@ -439,11 +504,11 @@ private func snapToRectangle(_ image: CGImage, around region: CGRect) -> CGImage
 
 /// One photo region -> cropped image: edge-based rectangle snap when Vision
 /// finds one, luminance-based tightening otherwise.
-private func cropRegion(_ image: CGImage, _ region: CGRect) -> CroppedImage? {
+private func cropRegion(_ image: CGImage, _ region: CGRect, background: Int) -> CroppedImage? {
     if let snapped = snapToRectangle(image, around: region) {
         return CroppedImage(image: snapped, method: "photo (edges)")
     }
-    return image.cropping(to: tightenRect(image, region))
+    return image.cropping(to: tightenRect(image, region, background: background))
         .map { CroppedImage(image: $0, method: "photo (bbox)") }
 }
 
@@ -452,7 +517,7 @@ private func cropRegion(_ image: CGImage, _ region: CGRect) -> CroppedImage? {
 /// Shrinks a crop rect until no near-white edge rows/columns remain (photo
 /// prints have their own white paper border), then bites a few extra pixels
 /// in. Losing a sliver of photo is preferred over keeping any white.
-private func tightenRect(_ image: CGImage, _ rect: CGRect) -> CGRect {
+private func tightenRect(_ image: CGImage, _ rect: CGRect, background: Int) -> CGRect {
     guard rect.width > 40, rect.height > 40,
           let region = image.cropping(to: rect) else { return rect }
 
@@ -460,7 +525,8 @@ private func tightenRect(_ image: CGImage, _ rect: CGRect) -> CGRect {
     // Only true bed rows count as blank: near-pure white AND flat. A pale
     // photo sky (learned on a Monaco skyline that lost its top) survives via
     // either its luminance or the print edge's gradient.
-    guard let (mask, scale) = contentMask(region, maxDim: 1200, threshold: 246) else { return rect }
+    guard let (mask, scale, _) = contentMask(region, maxDim: 1200, threshold: 246,
+                                             background: background) else { return rect }
     let sw = mask.width, sh = mask.height
 
     func rowDarkFraction(_ y: Int) -> Double {
@@ -508,7 +574,7 @@ private func tightenRect(_ image: CGImage, _ rect: CGRect) -> CGRect {
 
 /// Crops to the bounding box of all non-white content (plus a small margin).
 private func trimWhiteBorders(_ image: CGImage) -> CGImage? {
-    guard let (mask, scale) = contentMask(image, maxDim: 800, threshold: 246) else { return nil }
+    guard let (mask, scale, _) = contentMask(image, maxDim: 800, threshold: 246) else { return nil }
     let w = mask.width, h = mask.height
     // A row/column counts as content when >0.5% of its pixels are dark,
     // which keeps single specks of dust from defeating the trim.

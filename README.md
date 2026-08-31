@@ -43,6 +43,19 @@ vitre. Sans titre, chaque scan reçoit une base horodatée `scan-<timestamp>`.
 
 Les pages multiples du chargeur (ADF) sortent en fichiers `-p1`, `-p2`, …
 
+## Astuce : photos à bords très clairs
+
+Une photo dont le bord est quasi blanc (ciel délavé, nappe blanche…) peut se
+confondre avec le blanc de la vitre, même pour la détection par gradient. La
+parade imparable : poser une **feuille sombre** (papier noir, chemise foncée)
+sur les photos avant de fermer le capot, en couvrant toute la vitre.
+`retroscan` détecte automatiquement la couleur du fond et la découpe devient
+triviale, bords blancs compris.
+
+`RETROSCAN_DEBUG=1 retroscan …` affiche le niveau de fond détecté et les
+régions trouvées, utile pour diagnostiquer une découpe surprenante
+(à combiner avec `--input fichier.jpg` pour rejouer sans scanner).
+
 ## Rotation automatique
 
 `--rotate auto` (défaut) : détection de visages Vision dans les 4 orientations,
