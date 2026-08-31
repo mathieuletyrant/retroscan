@@ -4,7 +4,13 @@ import Network
 let usage = """
 retroscan — scan from a Brother network scanner, auto-crop, tag metadata.
 
-USAGE: retroscan [options]
+USAGE: retroscan [watch] [options]
+
+WATCH MODE
+  retroscan watch …      Register on the device's "Scan to PC" menu and wait:
+                         each press of the printer's Scan button triggers a
+                         scan with the given options. Numbering with --title
+                         continues across presses — ideal for whole albums.
 
 SCANNER
   --list                 List scanners found on the network and exit
@@ -62,6 +68,7 @@ func fail(_ message: String) -> Never {
 // MARK: - Argument parsing
 
 struct Options {
+    var watch = false
     var list = false
     var device: String?
     var host: String?
@@ -94,6 +101,7 @@ func parseOptions() -> Options {
         let arg = args.removeFirst()
         switch arg {
         case "-h", "--help": print(usage); exit(0)
+        case "watch", "--watch": opts.watch = true
         case "--list": opts.list = true
         case "--device": opts.device = value(for: arg)
         case "--host": opts.host = value(for: arg)
@@ -187,26 +195,72 @@ func acquirePages() -> (pages: [Data], dpi: Int, modelName: String?) {
         return ([data], opts.resolution, nil)
     }
     let (endpoint, modelName) = resolveScanner()
-    let client = BrotherScanClient(endpoint: endpoint)
     do {
-        try client.connect()
-        let caps = try client.queryCapabilities(resolution: opts.resolution, mode: .color)
-        print("Scanning \(caps.widthMM)×\(caps.heightMM) mm at \(caps.resolutionX) dpi (\(opts.grayscale ? "gray" : "color"))…")
-
-        var lastReported = 0
-        let pages = try client.scan(capabilities: caps, mode: .color) { page, bytes in
-            if bytes - lastReported > 512 * 1024 {
-                lastReported = bytes
-                print("  page \(page): \(bytes / 1024) KB…")
-            }
-        }
-        client.close()
-        guard !pages.isEmpty else { fail("scanner returned no data") }
-        return (pages, caps.resolutionX, modelName)
+        return try scanFromScanner(endpoint: endpoint, modelName: modelName)
     } catch {
-        client.close()
         fail("\(error)")
     }
+}
+
+func scanFromScanner(endpoint: NWEndpoint, modelName: String?) throws
+    -> (pages: [Data], dpi: Int, modelName: String?) {
+    let client = BrotherScanClient(endpoint: endpoint)
+    defer { client.close() }
+    try client.connect()
+    let caps = try client.queryCapabilities(resolution: opts.resolution, mode: .color)
+    print("Scanning \(caps.widthMM)×\(caps.heightMM) mm at \(caps.resolutionX) dpi (\(opts.grayscale ? "gray" : "color"))…")
+
+    var lastReported = 0
+    let pages = try client.scan(capabilities: caps, mode: .color) { page, bytes in
+        if bytes - lastReported > 512 * 1024 {
+            lastReported = bytes
+            print("  page \(page): \(bytes / 1024) KB…")
+        }
+    }
+    guard !pages.isEmpty else {
+        throw ScanError.deviceError("scanner returned no data")
+    }
+    return (pages, caps.resolutionX, modelName)
+}
+
+/// Opens a throwaway connection to learn the printer's and our own IPv4
+/// address — needed for the scan-button registration (SNMP + UDP callback).
+func resolveAddresses(endpoint: NWEndpoint) -> (printer: String, local: String) {
+    let conn = NWConnection(to: endpoint, using: .tcp)
+    let sem = DispatchSemaphore(value: 0)
+    var result: (String, String)?
+    conn.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+            func ip(_ ep: NWEndpoint?) -> String? {
+                guard case let .hostPort(host, _)? = ep else { return nil }
+                let text: String
+                switch host {
+                case .ipv4(let a): text = "\(a)"
+                case .ipv6(let a): text = "\(a)"
+                case .name(let n, _): text = n
+                @unknown default: return nil
+                }
+                return text.split(separator: "%").first.map(String.init)
+            }
+            let path = conn.currentPath
+            if let printer = ip(path?.remoteEndpoint), let local = ip(path?.localEndpoint) {
+                result = (printer, local)
+            }
+            sem.signal()
+        case .failed:
+            sem.signal()
+        default:
+            break
+        }
+    }
+    conn.start(queue: .global())
+    _ = sem.wait(timeout: .now() + 10)
+    conn.cancel()
+    guard let result else {
+        fail("could not determine printer/local address (try --host <ip>)")
+    }
+    return result
 }
 
 func resolveScanner() -> (NWEndpoint, String?) {
@@ -239,13 +293,11 @@ func resolveScanner() -> (NWEndpoint, String?) {
     return (chosen.endpoint, chosen.name)
 }
 
-let (pages, dpi, modelName) = acquirePages()
-
 // SAM (Segment Anything on the Neural Engine) is opt-in per run: the
 // classical detection usually crops tighter, SAM helps on photos whose
 // edges are nearly white. Models are downloaded once and cached.
-var sam: SAMDetector?
-if opts.sam == true && (opts.crop == .auto || opts.crop == .photos) {
+func makeSAM() -> SAMDetector? {
+    guard opts.sam == true, opts.crop == .auto || opts.crop == .photos else { return nil }
     if !SAMDetector.modelsPresent() {
         do {
             try SAMDetector.downloadModels { print("  \($0)") }
@@ -254,13 +306,14 @@ if opts.sam == true && (opts.crop == .auto || opts.crop == .photos) {
         }
     }
     do {
-        sam = try SAMDetector()
+        return try SAMDetector()
     } catch {
         FileHandle.standardError.write(Data("warning: SAM unavailable (\(error)), using classical detection\n".utf8))
+        return nil
     }
 }
 
-do {
+func processAndSave(pages: [Data], dpi: Int, modelName: String?, sam: SAMDetector?) throws {
     let dirURL = URL(fileURLWithPath: opts.outDir, isDirectory: true)
     try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
@@ -322,6 +375,43 @@ do {
             print("✓ \(url.path)  \(final.width)×\(final.height) px, \(sizeText), crop: \(cropped.method)\(rotationNote)")
         }
     }
-} catch {
-    fail("\(error)")
+}
+
+// MARK: - Entry point
+
+setlinebuf(stdout) // keep progress lines live when output is piped or logged
+
+if opts.watch {
+    guard opts.input == nil else { fail("--input cannot be combined with watch") }
+    let (endpoint, modelName) = resolveScanner()
+    let (printerIP, localIP) = resolveAddresses(endpoint: endpoint)
+    let sam = makeSAM()
+    let listener = PushScanListener(printerHost: printerIP, localIP: localIP,
+                                    displayName: "retroscan")
+    do {
+        try listener.start()
+    } catch {
+        fail("\(error)")
+    }
+    print("Registered on \(modelName ?? printerIP) as \"retroscan\".")
+    print("Press the device's Scan button and pick Scan to PC > retroscan. Ctrl+C to quit.")
+    while true {
+        do {
+            try listener.waitForButton()
+            print("Scan button pressed…")
+            let (pages, dpi, model) = try scanFromScanner(endpoint: endpoint, modelName: modelName)
+            try processAndSave(pages: pages, dpi: dpi, modelName: model, sam: sam)
+            print("Ready for the next press.")
+        } catch {
+            FileHandle.standardError.write(Data("retroscan: \(error) — still watching\n".utf8))
+            Thread.sleep(forTimeInterval: 3)
+        }
+    }
+} else {
+    let (pages, dpi, modelName) = acquirePages()
+    do {
+        try processAndSave(pages: pages, dpi: dpi, modelName: modelName, sam: makeSAM())
+    } catch {
+        fail("\(error)")
+    }
 }

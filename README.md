@@ -1,108 +1,140 @@
-# retroscan
+# 📸 retroscan
 
-CLI macOS (Swift, zéro dépendance, zéro driver) pour scanner depuis une
-imprimante Brother en réseau, recadrer automatiquement les images et y
-embarquer des métadonnées.
+A macOS CLI (Swift, zero dependencies, zero drivers) that scans from a
+networked Brother printer, auto-crops each photo, puts them upright, and
+embeds metadata — built for digitizing whole albums of old photo prints.
 
-Testé avec une Brother MFC-1910W. Fonctionne avec les modèles Brother qui
-exposent le service Bonjour `_scanner._tcp` (port 54921, le protocole des
-backends SANE `brscan`) — aucun driver Brother n'est nécessaire.
+Tested with a Brother MFC-1910W. Works with any Brother device exposing the
+`_scanner._tcp` Bonjour service (port 54921, the protocol behind the SANE
+`brscan` backends) — **no Brother driver needed**, even on macOS versions
+where none exists anymore.
 
-## Build
+## ✨ What it does
+
+- 🖨️ **Driverless scanning** — speaks the Brother network scan protocol directly
+- ✂️ **Multi-photo cropping** — lay several prints on the glass, get one tight
+  file per photo (paper borders shaved off)
+- 🔄 **Auto-rotation** — face detection puts people the right way up
+- 🏷️ **Metadata** — original shooting date, title, keywords, author, scanner
+  model, DPI, all embedded in EXIF/IPTC/TIFF
+- 🔘 **Watch mode** — press the printer's Scan button, the Mac does the rest
+- 🧠 **Optional Segment Anything** — SAM 2 on the Neural Engine for photos
+  whose edges are nearly white
+
+## 🚀 Install
 
 ```sh
-swift build -c release
-cp .build/release/retroscan /usr/local/bin/   # optionnel
+make build       # swift build -c release + sudo cp to /usr/local/bin
 ```
 
-## Usage
+## 🎯 Usage
 
 ```sh
-retroscan                          # scan couleur 300 dpi, crop auto, dans le dossier courant
-retroscan --list                   # liste les scanners du réseau
+retroscan                          # color 300 dpi scan, auto-crop, current dir
+retroscan --list                   # list scanners on the network
 retroscan -r 600 -m gray -o ~/Documents/Scans
-retroscan -t "Vacances 1995" -D 1995 -k photos,famille -a "Mathieu"
-retroscan -c photos                # force la découpe photo par photo
-retroscan -R none                  # désactive la rotation automatique
+retroscan -t "Holidays 1995" -D 1995 -k photos,family -a "Mathieu"
+retroscan -c photos                # force one-file-per-photo splitting
+retroscan -R none                  # disable auto-rotation
+retroscan --input page.jpg         # re-run crop/rotate/metadata on an existing scan
 ```
 
-Avec `--title` (ou `--name`), les fichiers sortent en `Vacances 1995-1.jpg`,
-`-2.jpg`, … et la numérotation **continue d'un scan à l'autre** dans le même
-dossier : idéal pour numériser un album par fournées de 3-4 photos sur la
-vitre. Sans titre, chaque scan reçoit une base horodatée `scan-<timestamp>`.
+`retroscan --help` shows every option.
 
-`retroscan --help` pour toutes les options.
+With `--title` (or `--name`), files come out as `Holidays 1995-1.jpg`,
+`-2.jpg`, … and **numbering continues from one run to the next** in the same
+folder: perfect for digitizing an album a few prints at a time. Without a
+title, each run gets a timestamped `scan-<timestamp>` base.
 
-## Ce que fait le crop `auto`
-
-1. Plusieurs photos posées sur la vitre → détection des régions (composantes
-   connexes sur fond blanc) et **un fichier par photo**.
-2. Un seul document détecté (Vision `VNDetectDocumentSegmentationRequest`) →
-   recadrage avec correction de perspective.
-3. Sinon → simple rognage des marges blanches.
-
-Les pages multiples du chargeur (ADF) sortent en fichiers `-p1`, `-p2`, …
-
-## Détection par Segment Anything (SAM 2) sur la puce Apple
+## 🔘 Watch mode: scan from the printer's button
 
 ```sh
-retroscan --sam        # télécharge les modèles Core ML (~78 Mo, une fois)
+retroscan watch -t "1995" -D 1995 -o ~/Documents/Scans/1995
 ```
 
-Avec `--sam`, la détection de photos s'appuie sur **Segment Anything 2**
-(conversion Core ML officielle d'Apple, exécutée sur le GPU/Neural Engine).
-La détection classique localise grossièrement chaque tirage, puis SAM en
-délimite le contour — y compris les bords invisibles aux seuils de
-luminance, comme un ciel délavé ou une nappe blanche contre le blanc de la
-vitre. Les modèles sont mis en cache dans
+The Mac registers itself on the device's **Scan to PC** menu (the
+`brscan-skey` protocol: an SNMP registration plus a UDP callback). Then:
+lay photos on the glass → press the printer's **Scan** button → pick
+*retroscan* on its LCD → files appear on the Mac, numbered in sequence.
+You never touch the computer during a scanning session.
+
+## ✂️ What `auto` cropping does
+
+1. Several photos on the bed → region detection (luminance + gradient
+   masks, connected components) and **one file per photo**, split along
+   any narrow bed-white seam when prints are laid almost touching.
+2. A single detected document → Vision perspective crop.
+3. Otherwise → plain white-border trim.
+
+Multiple pages from the ADF come out as `-p1`, `-p2`, … files.
+
+## 🔄 Auto-rotation
+
+`--rotate auto` (default): Vision face detection in all four orientations,
+weighted by face roll angle — photos of people come out upright. Photos with
+no detectable face are left as scanned. `--rotate 90|180|270` forces a
+clockwise rotation, `none` disables.
+
+## 🏷️ Embedded metadata
+
+Always: scan date (EXIF DateTimeDigitized), scanner make/model and software
+(TIFF), DPI. Optional: `--title` (IPTC ObjectName), `--keywords` (IPTC),
+`--author` (TIFF Artist + IPTC Byline), `--description` (EXIF UserComment +
+TIFF ImageDescription + IPTC Caption), and `--date` — when the photo was
+**taken** (`1995`, `1995-07` or `1995-07-14`), written to EXIF
+DateTimeOriginal + IPTC DateCreated: the field Apple Photos, Google Photos
+and Lightroom sort by.
+
+## 🧠 Segment Anything (SAM 2) on Apple silicon
+
+```sh
+retroscan --sam        # downloads Apple's Core ML models (~78 MB, once)
+```
+
+With `--sam`, photo detection is powered by **Segment Anything 2** (Apple's
+official Core ML conversion, running on the GPU/Neural Engine). The
+classical detection roughly locates each print, then SAM traces its true
+outline — including edges invisible to any threshold, like a washed-out sky
+or a white tablecloth against the bed white. Models are cached in
 `~/Library/Application Support/retroscan/`.
 
-C'est un mode d'appoint, pas le défaut : le masque de SAM est en 256×256
-(≈ 7 px de quantification sur un A4 à 300 dpi), donc la détection classique
-(luminance + gradient) recadre en général plus juste. Réserve `--sam` aux
-pages où une photo à bord très clair se fait mal découper — ou pose une
-feuille sombre sur les photos, voir ci-dessous.
+It's a rescue mode, not the default: SAM's 256×256 mask quantizes edges to
+~7 px on an A4 page at 300 dpi, so the classical luminance+gradient
+detection usually crops tighter. Reach for `--sam` when a pale-edged photo
+gets miscropped — or use the dark sheet trick below.
 
-## Astuce : photos à bords très clairs
+## 🖤 Tip: photos with near-white edges
 
-Une photo dont le bord est quasi blanc (ciel délavé, nappe blanche…) peut se
-confondre avec le blanc de la vitre, même pour la détection par gradient. La
-parade imparable : poser une **feuille sombre** (papier noir, chemise foncée)
-sur les photos avant de fermer le capot, en couvrant toute la vitre.
-`retroscan` détecte automatiquement la couleur du fond et la découpe devient
-triviale, bords blancs compris.
+A print whose edge is itself nearly white (washed-out sky, white
+tablecloth…) can be indistinguishable from the scanner bed. The bulletproof
+fix costs nothing: lay a **dark sheet of paper** over the photos before
+closing the lid, covering the whole glass. retroscan detects the background
+level automatically and the crop becomes trivial, white edges included.
 
-`RETROSCAN_DEBUG=1 retroscan …` affiche le niveau de fond détecté et les
-régions trouvées, utile pour diagnostiquer une découpe surprenante
-(à combiner avec `--input fichier.jpg` pour rejouer sans scanner).
+`RETROSCAN_DEBUG=1 retroscan …` prints the detected background level and
+regions — handy with `--input file.jpg` to replay a surprising crop without
+touching the scanner.
 
-## Rotation automatique
+## 🔌 Protocol notes (MFC-1910W)
 
-`--rotate auto` (défaut) : détection de visages Vision dans les 4 orientations,
-pondérée par l'angle de roulis — les photos de personnes sont remises dans le
-bon sens. Sans visage détecté, l'image reste telle que scannée.
-`--rotate 90|180|270` pour forcer, `none` pour désactiver.
+- Banner `+OK 200` on connecting to TCP 54921.
+- Query: `ESC I \n R=x,y \n M=mode \n 0x80` → `0x00 <len:2 LE> <csv> 0x00`
+  (resolution, width mm/px, height mm/px).
+- Scan: `ESC X` with `M=CGRAY` (= **24-bit color** JPEG, counter-intuitively),
+  `C=JPEG`, `A=0,0,w,h`, `D=SIN`. The hardware gray mode (`GRAY64`) uses an
+  RLE encoding — gray output is produced locally instead.
+- Stream: `0x64` blocks (12-byte header, length at bytes 10-11 LE, JPEG
+  payload), `0x82` end of page, `0x80` end of session, `0xc2` feeder empty,
+  `0xc3` paper jam, `0xc4` cover open.
+- Scan button: SNMPv1 SET (community `internal`, OID
+  `1.3.6.1.4.1.2435.2.3.9.2.11.1.1.0`) registers the host; the device then
+  sends a UDP datagram to the advertised port on each button press.
+- ⚠️ An invalid scan command (e.g. `M=C24BIT`, a family-5 mode) wedges the
+  printer's scan service for about a minute.
 
-## Métadonnées embarquées
+## 🙏 Credits
 
-Toujours : date de scan (EXIF DateTimeDigitized), marque/modèle du scanner et
-logiciel (TIFF), résolution DPI. En option : `--title` (IPTC ObjectName),
-`--keywords` (IPTC), `--author` (TIFF Artist + IPTC Byline), `--description`
-(EXIF UserComment + TIFF ImageDescription + IPTC Caption), et `--date` — la
-date de **prise de vue** de la photo d'origine (`1995`, `1995-07` ou
-`1995-07-14`), écrite en EXIF DateTimeOriginal + IPTC DateCreated : c'est elle
-que Photos et consorts utilisent pour classer les images.
-
-## Notes protocole (MFC-1910W)
-
-- Bannière `+OK 200` à la connexion sur le port 54921.
-- Query : `ESC I \n R=x,y \n M=mode \n 0x80` → `0x00 <len:2 LE> <csv> 0x00`
-  (résolution, largeur mm/px, hauteur mm/px).
-- Scan : `ESC X` avec `M=CGRAY` (= **couleur** 24 bits JPEG, contre-intuitif),
-  `C=JPEG`, `A=0,0,w,h`, `D=SIN`. Le mode gris matériel (`GRAY64`) utilise une
-  compression RLE — le gris est produit localement à la place.
-- Flux : blocs `0x64` (en-tête 12 octets, longueur aux octets 10-11 LE, données
-  JPEG), `0x82` fin de page, `0x80` fin de session, `0xc2` chargeur vide,
-  `0xc3` bourrage, `0xc4` capot ouvert.
-- Attention : une commande de scan invalide (ex. `M=C24BIT`) gèle le service
-  de scan de l'imprimante pendant ~1 minute.
+- Protocol details cross-checked against the in-progress
+  [`brother_mfp` SANE backend](https://gitlab.com/sane-project/backends/-/merge_requests/751).
+- SAM 2 Core ML models by [Apple on Hugging Face](https://huggingface.co/apple/coreml-sam2-tiny)
+  (Apache-2.0), integration informed by [sam2-studio](https://github.com/huggingface/sam2-studio).
