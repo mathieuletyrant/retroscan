@@ -286,10 +286,81 @@ private func detectContentRegions(_ image: CGImage) -> [CGRect] {
         rects.append(rect)
     }
 
+    // Prints laid almost touching on the glass can merge into one region;
+    // split any region crossed by a narrow all-white seam.
+    rects = rects.flatMap { splitMergedPhotos(image, $0) }
+        .filter { min($0.width, $0.height) >= Double(minSide) * inv }
+
     // Top-to-bottom, left-to-right output order.
     return rects.sorted {
         abs($0.minY - $1.minY) > 20 ? $0.minY < $1.minY : $0.minX < $1.minX
     }
+}
+
+// MARK: - Seam split (photos touching on the glass)
+
+/// Splits a region wherever a narrow band of near-bed-white runs all the way
+/// across it — the gap between two prints laid too close together. A pale
+/// area inside one photo never qualifies: it would have to be a full-length,
+/// nearly pure-white stripe thinner than 4% of the region.
+private func splitMergedPhotos(_ image: CGImage, _ rect: CGRect, depth: Int = 0) -> [CGRect] {
+    guard depth < 3, rect.width > 80, rect.height > 80,
+          let region = image.cropping(to: rect) else { return [rect] }
+
+    let maxDim = 900
+    let scale = min(1.0, Double(maxDim) / Double(max(region.width, region.height)))
+    let sw = max(1, Int(Double(region.width) * scale))
+    let sh = max(1, Int(Double(region.height) * scale))
+    guard let ctx = CGContext(data: nil, width: sw, height: sh, bitsPerComponent: 8,
+                              bytesPerRow: sw, space: CGColorSpaceCreateDeviceGray(),
+                              bitmapInfo: CGImageAlphaInfo.none.rawValue),
+          case _ = ctx.draw(region, in: CGRect(x: 0, y: 0, width: sw, height: sh)),
+          let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return [rect] }
+
+    // Fraction of near-bed-white pixels per column/row.
+    func whiteFraction(column x: Int) -> Double {
+        var white = 0
+        for y in 0..<sh where pixels[y * sw + x] >= 248 { white += 1 }
+        return Double(white) / Double(sh)
+    }
+    func whiteFraction(row y: Int) -> Double {
+        var white = 0
+        for x in 0..<sw where pixels[y * sw + x] >= 248 { white += 1 }
+        return Double(white) / Double(sw)
+    }
+
+    let inv = 1.0 / scale
+    // (span, isBlank at index, make the two sub-rects from a seam center)
+    let axes: [(Int, (Int) -> Bool, (Double) -> (CGRect, CGRect))] = [
+        (sw, { whiteFraction(column: $0) >= 0.99 }, { cut in
+            (CGRect(x: rect.minX, y: rect.minY, width: cut, height: rect.height),
+             CGRect(x: rect.minX + cut, y: rect.minY, width: rect.width - cut, height: rect.height))
+        }),
+        (sh, { whiteFraction(row: $0) >= 0.99 }, { cut in
+            (CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: cut),
+             CGRect(x: rect.minX, y: rect.minY + cut, width: rect.width, height: rect.height - cut))
+        }),
+    ]
+
+    for (span, isBlank, makeRects) in axes {
+        let maxSeamWidth = max(3, span * 4 / 100)
+        let minSide = span / 10
+        var i = minSide
+        while i < span - minSide {
+            guard isBlank(i) else { i += 1; continue }
+            var j = i
+            while j + 1 < span && isBlank(j + 1) { j += 1 }
+            let width = j - i + 1
+            if width <= maxSeamWidth && j < span - minSide {
+                let cut = Double(i + j + 1) / 2 * inv
+                let (a, b) = makeRects(cut)
+                return splitMergedPhotos(image, a, depth: depth + 1)
+                    + splitMergedPhotos(image, b, depth: depth + 1)
+            }
+            i = j + 1
+        }
+    }
+    return [rect]
 }
 
 // MARK: - Rectangle snap (Vision edge detection)
