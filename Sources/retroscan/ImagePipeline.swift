@@ -157,8 +157,9 @@ private struct Mask {
 }
 
 /// Downscaled thresholded view of the page: true where the pixel is not
-/// scanner-bed white.
-private func contentMask(_ image: CGImage, maxDim: Int) -> (Mask, Double)? {
+/// scanner-bed white. The bed scans as near-pure white (≥250) while even a
+/// pale photo sky stays textured below that, so the cutoff sits high.
+private func contentMask(_ image: CGImage, maxDim: Int, threshold: UInt8) -> (Mask, Double)? {
     let scale = min(1.0, Double(maxDim) / Double(max(image.width, image.height)))
     let sw = max(1, Int(Double(image.width) * scale))
     let sh = max(1, Int(Double(image.height) * scale))
@@ -171,7 +172,7 @@ private func contentMask(_ image: CGImage, maxDim: Int) -> (Mask, Double)? {
     guard let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
 
     var bits = [Bool](repeating: false, count: sw * sh)
-    for i in 0..<(sw * sh) where pixels[i] < 235 { bits[i] = true }
+    for i in 0..<(sw * sh) where pixels[i] < threshold { bits[i] = true }
     return (Mask(bits: bits, width: sw, height: sh), scale)
 }
 
@@ -199,7 +200,7 @@ private func dilate(_ mask: Mask, radius: Int) -> Mask {
 /// Finds bounding boxes (in full-resolution pixels) of distinct content
 /// regions large enough to be photos/documents.
 private func detectContentRegions(_ image: CGImage) -> [CGRect] {
-    guard let (rawMask, scale) = contentMask(image, maxDim: 600) else { return [] }
+    guard let (rawMask, scale) = contentMask(image, maxDim: 600, threshold: 246) else { return [] }
     let mask = dilate(rawMask, radius: 2)
     let w = mask.width, h = mask.height
 
@@ -293,20 +294,23 @@ private func tightenRect(_ image: CGImage, _ rect: CGRect) -> CGRect {
     guard let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return rect }
 
     // Buffer row 0 is the top of the region, matching cropping(to:) coords.
+    // Only near-pure bed white counts as blank here: a pale photo sky sits in
+    // the 225–245 range and must survive (learned on a Monaco skyline that
+    // lost its top). Bed rows have essentially no pixel below 246.
     func rowDarkFraction(_ y: Int) -> Double {
         var dark = 0
-        for x in 0..<sw where pixels[y * sw + x] < 230 { dark += 1 }
+        for x in 0..<sw where pixels[y * sw + x] < 246 { dark += 1 }
         return Double(dark) / Double(sw)
     }
     func colDarkFraction(_ x: Int) -> Double {
         var dark = 0
-        for y in 0..<sh where pixels[y * sw + x] < 230 { dark += 1 }
+        for y in 0..<sh where pixels[y * sw + x] < 246 { dark += 1 }
         return Double(dark) / Double(sh)
     }
 
-    let need = 0.03           // a row/column with <3% dark pixels is "white"
-    let maxShrinkY = sh * 15 / 100
-    let maxShrinkX = sw * 15 / 100
+    let need = 0.02           // a row/column with <2% such pixels is bed white
+    let maxShrinkY = sh * 8 / 100
+    let maxShrinkX = sw * 8 / 100
 
     var top = 0
     while top < maxShrinkY && rowDarkFraction(top) < need { top += 1 }
@@ -335,7 +339,7 @@ private func tightenRect(_ image: CGImage, _ rect: CGRect) -> CGRect {
 
 /// Crops to the bounding box of all non-white content (plus a small margin).
 private func trimWhiteBorders(_ image: CGImage) -> CGImage? {
-    guard let (mask, scale) = contentMask(image, maxDim: 800) else { return nil }
+    guard let (mask, scale) = contentMask(image, maxDim: 800, threshold: 235) else { return nil }
     let w = mask.width, h = mask.height
     // A row/column counts as content when >0.5% of its pixels are dark,
     // which keeps single specks of dust from defeating the trim.

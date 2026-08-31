@@ -14,6 +14,8 @@ SCANNER
 SCAN
   -r, --resolution <dpi> 100 | 150 | 200 | 300 | 600      (default: 300)
   -m, --mode <mode>      color | gray                     (default: color)
+  -i, --input <file>     Skip the scanner: run the crop/rotate/metadata
+                         pipeline on an existing scan JPEG instead
 
 OUTPUT
   -o, --out <dir>        Output directory                 (default: current dir)
@@ -58,6 +60,7 @@ struct Options {
     var list = false
     var device: String?
     var host: String?
+    var input: String?
     var resolution = 300
     var grayscale = false
     var outDir = FileManager.default.currentDirectoryPath
@@ -88,6 +91,7 @@ func parseOptions() -> Options {
         case "--list": opts.list = true
         case "--device": opts.device = value(for: arg)
         case "--host": opts.host = value(for: arg)
+        case "-i", "--input": opts.input = (value(for: arg) as NSString).expandingTildeInPath
         case "-r", "--resolution":
             guard let r = Int(value(for: arg)), [100, 150, 200, 300, 600].contains(r) else {
                 fail("resolution must be one of 100, 150, 200, 300, 600")
@@ -165,15 +169,45 @@ func nextFreeIndex(in dir: URL, base: String) -> Int {
 
 let opts = parseOptions()
 
-var endpoint: NWEndpoint
-var modelName: String?
+/// Reads the pages either from an existing file (--input) or from the scanner.
+func acquirePages() -> (pages: [Data], dpi: Int, modelName: String?) {
+    if let input = opts.input {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: input)) else {
+            fail("cannot read \(input)")
+        }
+        print("Processing \(input)…")
+        return ([data], opts.resolution, nil)
+    }
+    let (endpoint, modelName) = resolveScanner()
+    let client = BrotherScanClient(endpoint: endpoint)
+    do {
+        try client.connect()
+        let caps = try client.queryCapabilities(resolution: opts.resolution, mode: .color)
+        print("Scanning \(caps.widthMM)×\(caps.heightMM) mm at \(caps.resolutionX) dpi (\(opts.grayscale ? "gray" : "color"))…")
 
-if let host = opts.host {
-    let parts = host.split(separator: ":")
-    let port = parts.count > 1 ? UInt16(parts[1]) ?? 54921 : 54921
-    endpoint = .hostPort(host: NWEndpoint.Host(String(parts[0])),
-                         port: NWEndpoint.Port(rawValue: port)!)
-} else {
+        var lastReported = 0
+        let pages = try client.scan(capabilities: caps, mode: .color) { page, bytes in
+            if bytes - lastReported > 512 * 1024 {
+                lastReported = bytes
+                print("  page \(page): \(bytes / 1024) KB…")
+            }
+        }
+        client.close()
+        guard !pages.isEmpty else { fail("scanner returned no data") }
+        return (pages, caps.resolutionX, modelName)
+    } catch {
+        client.close()
+        fail("\(error)")
+    }
+}
+
+func resolveScanner() -> (NWEndpoint, String?) {
+    if let host = opts.host {
+        let parts = host.split(separator: ":")
+        let port = parts.count > 1 ? UInt16(parts[1]) ?? 54921 : 54921
+        return (.hostPort(host: NWEndpoint.Host(String(parts[0])),
+                          port: NWEndpoint.Port(rawValue: port)!), nil)
+    }
     print("Searching for scanners…")
     let scanners = discoverScanners()
     if opts.list {
@@ -193,35 +227,20 @@ if let host = opts.host {
     } else {
         chosen = scanners[0]
     }
-    endpoint = chosen.endpoint
-    modelName = chosen.name
     print("Using \(chosen.name)")
+    return (chosen.endpoint, chosen.name)
 }
 
-let client = BrotherScanClient(endpoint: endpoint)
+let (pages, dpi, modelName) = acquirePages()
+
 do {
-    try client.connect()
-    let caps = try client.queryCapabilities(resolution: opts.resolution, mode: .color)
-    print("Scanning \(caps.widthMM)×\(caps.heightMM) mm at \(caps.resolutionX) dpi (\(opts.grayscale ? "gray" : "color"))…")
-
-    var lastReported = 0
-    let pages = try client.scan(capabilities: caps, mode: .color) { page, bytes in
-        if bytes - lastReported > 512 * 1024 {
-            lastReported = bytes
-            print("  page \(page): \(bytes / 1024) KB…")
-        }
-    }
-    client.close()
-
-    guard !pages.isEmpty else { fail("scanner returned no data") }
-
     let dirURL = URL(fileURLWithPath: opts.outDir, isDirectory: true)
     try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
     let metadata = ImageMetadata(
         title: opts.title, description: opts.description, author: opts.author,
         keywords: opts.keywords, contentDate: opts.contentDate, scannerModel: modelName,
-        dpi: caps.resolutionX, jpegQuality: opts.quality)
+        dpi: dpi, jpegQuality: opts.quality)
 
     var images: [CroppedImage] = []
     for jpeg in pages {
@@ -276,10 +295,6 @@ do {
             print("✓ \(url.path)  \(final.width)×\(final.height) px, \(sizeText), crop: \(cropped.method)\(rotationNote)")
         }
     }
-} catch let error as ScanError {
-    client.close()
-    fail("\(error)")
 } catch {
-    client.close()
     fail("\(error)")
 }
