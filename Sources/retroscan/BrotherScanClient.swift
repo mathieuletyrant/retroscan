@@ -206,6 +206,7 @@ final class BrotherScanClient {
         var pages: [Data] = []
         var current = Data()
         var received = 0
+        var pageJustEnded = false
 
         func finishPage() {
             if !current.isEmpty {
@@ -215,7 +216,24 @@ final class BrotherScanClient {
         }
 
         while true {
-            let type = try conn.read(exactly: 1, timeout: readTimeout)[0]
+            let type: UInt8
+            if pageJustEnded {
+                // After a page the device waits ~30 s for the host to either
+                // request another page or cancel before it closes the session
+                // on its own. Give an immediate follow-up a moment, then tell
+                // it we are done (ESC R) — like the SANE backend does.
+                pageJustEnded = false
+                do {
+                    type = try conn.read(exactly: 1, timeout: 2.5)[0]
+                } catch let error as ScanError {
+                    guard case .timeout = error else { throw error }
+                    try? conn.send(Data([0x1b, 0x52])) // ESC R: cancel/finish
+                    _ = try? conn.readSome(timeout: 1)
+                    return pages
+                }
+            } else {
+                type = try conn.read(exactly: 1, timeout: readTimeout)[0]
+            }
             switch type {
             case 0x80: // end of session
                 finishPage()
@@ -223,10 +241,11 @@ final class BrotherScanClient {
             case 0x81, 0x82: // end of page (0x81: more pages follow, e.g. from the ADF)
                 // On the MFC-1910W these carry a 9-byte tail starting 07 00;
                 // consume it only when actually present.
-                if try conn.peek(count: 2, timeout: readTimeout) == Data([0x07, 0x00]) {
+                if (try? conn.peek(count: 2, timeout: 2.5)) == Data([0x07, 0x00]) {
                     _ = try conn.read(exactly: 9, timeout: readTimeout)
                 }
                 finishPage()
+                pageJustEnded = true
             case 0x64: // JPEG data block
                 let header = try conn.read(exactly: 11, timeout: readTimeout)
                 let length = Int(header[9]) | (Int(header[10]) << 8)
