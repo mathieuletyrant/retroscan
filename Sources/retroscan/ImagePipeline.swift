@@ -91,10 +91,7 @@ func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage]
     case .photos:
         let regions = detectContentRegions(image)
         if !regions.isEmpty {
-            return regions.compactMap { rect in
-                image.cropping(to: tightenRect(image, rect))
-                    .map { CroppedImage(image: $0, method: "photo") }
-            }
+            return regions.compactMap { cropRegion(image, $0) }
         }
         return [CroppedImage(image: image, method: "none")]
 
@@ -105,11 +102,14 @@ func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage]
         return [CroppedImage(image: image, method: "none")]
 
     case .auto:
-        let regions = detectContentRegions(image).map { tightenRect(image, $0) }
+        let regions = detectContentRegions(image)
         if regions.count >= 2 {
-            return regions.compactMap { rect in
-                image.cropping(to: rect).map { CroppedImage(image: $0, method: "photo") }
-            }
+            return regions.compactMap { cropRegion(image, $0) }
+        }
+        // A single region is either a lone photo or a document: try the
+        // photo rectangle snap first, then document segmentation.
+        if let region = regions.first, let snapped = snapToRectangle(image, around: region) {
+            return [CroppedImage(image: snapped, method: "photo (edges)")]
         }
         if let doc = detectAndCropDocument(image) {
             return [CroppedImage(image: doc, method: "document")]
@@ -157,9 +157,14 @@ private struct Mask {
 }
 
 /// Downscaled thresholded view of the page: true where the pixel is not
-/// scanner-bed white. The bed scans as near-pure white (≥250) while even a
-/// pale photo sky stays textured below that, so the cutoff sits high.
-private func contentMask(_ image: CGImage, maxDim: Int, threshold: UInt8) -> (Mask, Double)? {
+/// scanner-bed white. Two signals are combined, because luminance alone
+/// cannot tell a washed-out photo sky (which can scan at 246+) from the bed:
+///  - luminance: bed scans near-pure white (≥250), so anything below
+///    `threshold` is content;
+///  - gradient: the bed is perfectly flat while a print's edge is always a
+///    luminance step, so any local step > `gradientThreshold` is content too.
+private func contentMask(_ image: CGImage, maxDim: Int, threshold: UInt8,
+                         gradientThreshold: Int = 3) -> (Mask, Double)? {
     let scale = min(1.0, Double(maxDim) / Double(max(image.width, image.height)))
     let sw = max(1, Int(Double(image.width) * scale))
     let sh = max(1, Int(Double(image.height) * scale))
@@ -172,7 +177,21 @@ private func contentMask(_ image: CGImage, maxDim: Int, threshold: UInt8) -> (Ma
     guard let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
 
     var bits = [Bool](repeating: false, count: sw * sh)
-    for i in 0..<(sw * sh) where pixels[i] < threshold { bits[i] = true }
+    for y in 0..<sh {
+        for x in 0..<sw {
+            let i = y * sw + x
+            let v = Int(pixels[i])
+            // The gradient spans two pixels because downscaling smears a
+            // print edge's step across neighbours.
+            if v < Int(threshold) {
+                bits[i] = true
+            } else if x + 2 < sw, abs(v - Int(pixels[i + 2])) > gradientThreshold {
+                bits[i] = true
+            } else if y + 2 < sh, abs(v - Int(pixels[i + 2 * sw])) > gradientThreshold {
+                bits[i] = true
+            }
+        }
+    }
     return (Mask(bits: bits, width: sw, height: sh), scale)
 }
 
@@ -273,6 +292,90 @@ private func detectContentRegions(_ image: CGImage) -> [CGRect] {
     }
 }
 
+// MARK: - Rectangle snap (Vision edge detection)
+
+/// Refines a coarse content region to the photo print's true rectangle using
+/// edge-based detection, which sees the print's boundary even where a pale
+/// sky is indistinguishable from bed white by luminance alone. Returns the
+/// perspective-corrected crop, or nil when no convincing rectangle is found.
+private func snapToRectangle(_ image: CGImage, around region: CGRect) -> CGImage? {
+    let w = CGFloat(image.width)
+    let h = CGFloat(image.height)
+    // The region can underestimate the photo (a washed-out sky band may be
+    // missing from it), so search well beyond it.
+    let pad = max(w, h) * 0.05
+    let search = region.insetBy(dx: -pad, dy: -pad)
+        .intersection(CGRect(x: 0, y: 0, width: w, height: h))
+
+    // Vision wants a bottom-left-origin normalized ROI.
+    let roi = CGRect(x: search.minX / w,
+                     y: 1 - search.maxY / h,
+                     width: search.width / w,
+                     height: search.height / h)
+
+    let request = VNDetectRectanglesRequest()
+    request.maximumObservations = 5
+    request.minimumAspectRatio = 0.2
+    request.maximumAspectRatio = 1.0
+    request.quadratureTolerance = 20
+    request.minimumConfidence = 0.5
+    request.minimumSize = 0.3
+    request.regionOfInterest = roi
+
+    let handler = VNImageRequestHandler(cgImage: image, options: [:])
+    guard (try? handler.perform([request])) != nil,
+          let observations = request.results, !observations.isEmpty else { return nil }
+
+    // Observation points are normalized to the ROI, bottom-left origin.
+    // Map them to top-left-origin pixels to compare against `region`.
+    func pixelPoint(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: (roi.minX + p.x * roi.width) * w,
+                y: (1 - (roi.minY + p.y * roi.height)) * h)
+    }
+
+    var best: (obs: VNRectangleObservation, box: CGRect, overlap: Double)?
+    for obs in observations {
+        let corners = [obs.topLeft, obs.topRight, obs.bottomLeft, obs.bottomRight].map(pixelPoint)
+        let xs = corners.map(\.x), ys = corners.map(\.y)
+        let box = CGRect(x: xs.min()!, y: ys.min()!,
+                         width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
+        // The right rectangle mostly covers our region and stays in the same
+        // ballpark of size — a neighbour photo's quad barely overlaps.
+        let overlap = Double(box.intersection(region).width * box.intersection(region).height)
+        let regionArea = Double(region.width * region.height)
+        let boxArea = Double(box.width * box.height)
+        guard overlap > regionArea * 0.5, boxArea < regionArea * 2.5 else { continue }
+        if overlap > (best?.overlap ?? 0) {
+            best = (obs, box, overlap)
+        }
+    }
+    guard let best else { return nil }
+
+    // CIPerspectiveCorrection takes bottom-left-origin pixel coordinates,
+    // which is what Vision's normalized points map to directly.
+    func ciPoint(_ p: CGPoint) -> CIVector {
+        CIVector(cgPoint: CGPoint(x: (roi.minX + p.x * roi.width) * w,
+                                  y: (roi.minY + p.y * roi.height) * h))
+    }
+    let corrected = CIImage(cgImage: image).applyingFilter("CIPerspectiveCorrection", parameters: [
+        "inputTopLeft": ciPoint(best.obs.topLeft),
+        "inputTopRight": ciPoint(best.obs.topRight),
+        "inputBottomLeft": ciPoint(best.obs.bottomLeft),
+        "inputBottomRight": ciPoint(best.obs.bottomRight),
+    ])
+    return ciContext.createCGImage(corrected, from: corrected.extent)
+}
+
+/// One photo region -> cropped image: edge-based rectangle snap when Vision
+/// finds one, luminance-based tightening otherwise.
+private func cropRegion(_ image: CGImage, _ region: CGRect) -> CroppedImage? {
+    if let snapped = snapToRectangle(image, around: region) {
+        return CroppedImage(image: snapped, method: "photo (edges)")
+    }
+    return image.cropping(to: tightenRect(image, region))
+        .map { CroppedImage(image: $0, method: "photo (bbox)") }
+}
+
 // MARK: - Edge tightening
 
 /// Shrinks a crop rect until no near-white edge rows/columns remain (photo
@@ -282,35 +385,30 @@ private func tightenRect(_ image: CGImage, _ rect: CGRect) -> CGRect {
     guard rect.width > 40, rect.height > 40,
           let region = image.cropping(to: rect) else { return rect }
 
-    let maxDim = 1200
-    let scale = min(1.0, Double(maxDim) / Double(max(region.width, region.height)))
-    let sw = max(1, Int(Double(region.width) * scale))
-    let sh = max(1, Int(Double(region.height) * scale))
-    guard let ctx = CGContext(data: nil, width: sw, height: sh, bitsPerComponent: 8,
-                              bytesPerRow: sw, space: CGColorSpaceCreateDeviceGray(),
-                              bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return rect }
-    ctx.interpolationQuality = .low
-    ctx.draw(region, in: CGRect(x: 0, y: 0, width: sw, height: sh))
-    guard let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return rect }
-
     // Buffer row 0 is the top of the region, matching cropping(to:) coords.
-    // Only near-pure bed white counts as blank here: a pale photo sky sits in
-    // the 225–245 range and must survive (learned on a Monaco skyline that
-    // lost its top). Bed rows have essentially no pixel below 246.
+    // Only true bed rows count as blank: near-pure white AND flat. A pale
+    // photo sky (learned on a Monaco skyline that lost its top) survives via
+    // either its luminance or the print edge's gradient.
+    guard let (mask, scale) = contentMask(region, maxDim: 1200, threshold: 246) else { return rect }
+    let sw = mask.width, sh = mask.height
+
     func rowDarkFraction(_ y: Int) -> Double {
         var dark = 0
-        for x in 0..<sw where pixels[y * sw + x] < 246 { dark += 1 }
+        for x in 0..<sw where mask.bits[y * sw + x] { dark += 1 }
         return Double(dark) / Double(sw)
     }
     func colDarkFraction(_ x: Int) -> Double {
         var dark = 0
-        for y in 0..<sh where pixels[y * sw + x] < 246 { dark += 1 }
+        for y in 0..<sh where mask.bits[y * sw + x] { dark += 1 }
         return Double(dark) / Double(sh)
     }
 
     let need = 0.02           // a row/column with <2% such pixels is bed white
-    let maxShrinkY = sh * 8 / 100
-    let maxShrinkX = sw * 8 / 100
+    // The walk exists to shave paper borders off prints; the region edge is
+    // already accurate (gradient outline), so cap it low — a featureless sky
+    // band looks just like a border to this test and must not be eaten.
+    let maxShrinkY = sh * 3 / 100
+    let maxShrinkX = sw * 3 / 100
 
     var top = 0
     while top < maxShrinkY && rowDarkFraction(top) < need { top += 1 }
@@ -339,7 +437,7 @@ private func tightenRect(_ image: CGImage, _ rect: CGRect) -> CGRect {
 
 /// Crops to the bounding box of all non-white content (plus a small margin).
 private func trimWhiteBorders(_ image: CGImage) -> CGImage? {
-    guard let (mask, scale) = contentMask(image, maxDim: 800, threshold: 235) else { return nil }
+    guard let (mask, scale) = contentMask(image, maxDim: 800, threshold: 246) else { return nil }
     let w = mask.width, h = mask.height
     // A row/column counts as content when >0.5% of its pixels are dark,
     // which keeps single specks of dust from defeating the trim.
