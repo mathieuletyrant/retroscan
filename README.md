@@ -43,6 +43,26 @@ vitre. Sans titre, chaque scan reçoit une base horodatée `scan-<timestamp>`.
 
 Les pages multiples du chargeur (ADF) sortent en fichiers `-p1`, `-p2`, …
 
+## Détection par Segment Anything (SAM 2) sur la puce Apple
+
+```sh
+retroscan --sam        # télécharge les modèles Core ML (~78 Mo, une fois)
+```
+
+Avec `--sam`, la détection de photos s'appuie sur **Segment Anything 2**
+(conversion Core ML officielle d'Apple, exécutée sur le GPU/Neural Engine).
+La détection classique localise grossièrement chaque tirage, puis SAM en
+délimite le contour — y compris les bords invisibles aux seuils de
+luminance, comme un ciel délavé ou une nappe blanche contre le blanc de la
+vitre. Les modèles sont mis en cache dans
+`~/Library/Application Support/retroscan/`.
+
+C'est un mode d'appoint, pas le défaut : le masque de SAM est en 256×256
+(≈ 7 px de quantification sur un A4 à 300 dpi), donc la détection classique
+(luminance + gradient) recadre en général plus juste. Réserve `--sam` aux
+pages où une photo à bord très clair se fait mal découper — ou pose une
+feuille sombre sur les photos, voir ci-dessous.
+
 ## Astuce : photos à bords très clairs
 
 Une photo dont le bord est quasi blanc (ciel délavé, nappe blanche…) peut se

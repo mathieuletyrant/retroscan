@@ -72,7 +72,7 @@ private let ciContext = CIContext()
 
 /// Applies the crop strategy to one scanned page. May return several images
 /// (e.g. multiple photos laid out on the flatbed).
-func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage] {
+func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?) throws -> [CroppedImage] {
     guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
           let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         throw PipelineError.decodeFailed
@@ -91,7 +91,8 @@ func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage]
     case .photos:
         let (regions, background) = detectContentRegions(image)
         if !regions.isEmpty {
-            return regions.compactMap { cropRegion(image, $0, background: background) }
+            let sam = encodedSAM(sam, image)
+            return regions.compactMap { cropRegion(image, $0, background: background, sam: sam) }
         }
         return [CroppedImage(image: image, method: "none")]
 
@@ -104,12 +105,21 @@ func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage]
     case .auto:
         let (regions, background) = detectContentRegions(image)
         if regions.count >= 2 {
-            return regions.compactMap { cropRegion(image, $0, background: background) }
+            let sam = encodedSAM(sam, image)
+            return regions.compactMap { cropRegion(image, $0, background: background, sam: sam) }
         }
-        // A single region is either a lone photo or a document: try the
-        // photo rectangle snap first, then document segmentation.
-        if let region = regions.first, let snapped = snapToRectangle(image, around: region) {
-            return [CroppedImage(image: snapped, method: "photo (edges)")]
+        // A single region is either a lone photo or a document.
+        if let region = regions.first {
+            let wholePage = Double(region.width * region.height)
+                > Double(image.width * image.height) * 0.9
+            if !wholePage, let sam = encodedSAM(sam, image),
+               let refined = try? sam.refine(region: region),
+               let cropped = image.cropping(to: tightenRect(image, refined, background: background)) {
+                return [CroppedImage(image: cropped, method: "photo (SAM)")]
+            }
+            if let snapped = snapToRectangle(image, around: region) {
+                return [CroppedImage(image: snapped, method: "photo (edges)")]
+            }
         }
         if let doc = detectAndCropDocument(image) {
             return [CroppedImage(image: doc, method: "document")]
@@ -118,6 +128,19 @@ func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage]
             return [CroppedImage(image: trimmed, method: "trim")]
         }
         return [CroppedImage(image: image, method: "none")]
+    }
+}
+
+/// Runs the SAM image encoder for this page, once; nil when SAM is off or
+/// the encoding fails (the classical pipeline takes over).
+private func encodedSAM(_ sam: SAMDetector?, _ image: CGImage) -> SAMDetector? {
+    guard let sam else { return nil }
+    do {
+        try sam.encode(page: image)
+        return sam
+    } catch {
+        FileHandle.standardError.write(Data("warning: SAM encoding failed (\(error)), falling back\n".utf8))
+        return nil
     }
 }
 
@@ -504,7 +527,18 @@ private func snapToRectangle(_ image: CGImage, around region: CGRect) -> CGImage
 
 /// One photo region -> cropped image: edge-based rectangle snap when Vision
 /// finds one, luminance-based tightening otherwise.
-private func cropRegion(_ image: CGImage, _ region: CGRect, background: Int) -> CroppedImage? {
+private func cropRegion(_ image: CGImage, _ region: CGRect, background: Int,
+                        sam: SAMDetector?) -> CroppedImage? {
+    // SAM pins the print's true extent (even edges invisible to thresholds);
+    // the tighten pass then shaves the print's own white paper border. A
+    // region covering nearly the whole page is an already-cropped image:
+    // there is no background to separate and SAM would segment inside it.
+    let pageArea = Double(image.width * image.height)
+    let regionIsWholePage = Double(region.width * region.height) > pageArea * 0.9
+    if let sam, !regionIsWholePage, let refined = try? sam.refine(region: region),
+       let cropped = image.cropping(to: tightenRect(image, refined, background: background)) {
+        return CroppedImage(image: cropped, method: "photo (SAM)")
+    }
     if let snapped = snapToRectangle(image, around: region) {
         return CroppedImage(image: snapped, method: "photo (edges)")
     }
@@ -541,20 +575,37 @@ private func tightenRect(_ image: CGImage, _ rect: CGRect, background: Int) -> C
     }
 
     let need = 0.02           // a row/column with <2% such pixels is bed white
-    // The walk exists to shave paper borders off prints; the region edge is
-    // already accurate (gradient outline), so cap it low — a featureless sky
-    // band looks just like a border to this test and must not be eaten.
-    let maxShrinkY = sh * 3 / 100
-    let maxShrinkX = sw * 3 / 100
-
+    // Rows with essentially nothing (≤2 mask pixels) are true background and
+    // can be stripped without limit — even a featureless sky row carries the
+    // print edge's gradient columns. The capped walk after that only shaves
+    // the print's own paper border; a sky band must survive it, hence 3%.
+    func isEmptyRow(_ y: Int) -> Bool {
+        var dark = 0
+        for x in 0..<sw where mask.bits[y * sw + x] { dark += 1; if dark > 2 { return false } }
+        return true
+    }
+    func isEmptyCol(_ x: Int) -> Bool {
+        var dark = 0
+        for y in 0..<sh where mask.bits[y * sw + x] { dark += 1; if dark > 2 { return false } }
+        return true
+    }
     var top = 0
-    while top < maxShrinkY && rowDarkFraction(top) < need { top += 1 }
+    while top < sh - 1 && isEmptyRow(top) { top += 1 }
     var bottom = 0
-    while bottom < maxShrinkY && rowDarkFraction(sh - 1 - bottom) < need { bottom += 1 }
+    while bottom < sh - 1 - top && isEmptyRow(sh - 1 - bottom) { bottom += 1 }
     var left = 0
-    while left < maxShrinkX && colDarkFraction(left) < need { left += 1 }
+    while left < sw - 1 && isEmptyCol(left) { left += 1 }
     var right = 0
-    while right < maxShrinkX && colDarkFraction(sw - 1 - right) < need { right += 1 }
+    while right < sw - 1 - left && isEmptyCol(sw - 1 - right) { right += 1 }
+
+    let maxShrinkY = top + sh * 3 / 100
+    let maxShrinkX = left + sw * 3 / 100
+    let maxShrinkY2 = bottom + sh * 3 / 100
+    let maxShrinkX2 = right + sw * 3 / 100
+    while top < maxShrinkY && rowDarkFraction(top) < need { top += 1 }
+    while bottom < maxShrinkY2 && rowDarkFraction(sh - 1 - bottom) < need { bottom += 1 }
+    while left < maxShrinkX && colDarkFraction(left) < need { left += 1 }
+    while right < maxShrinkX2 && colDarkFraction(sw - 1 - right) < need { right += 1 }
 
     let inv = 1.0 / scale
     // The extra bite past the last white row, so edge shadows and border
