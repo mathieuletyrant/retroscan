@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var model: ScanModel
+    @State private var confirmingClear = false
 
     var body: some View {
         NavigationSplitView {
@@ -43,6 +44,26 @@ struct ContentView: View {
                 }
                 .disabled(!model.canReprocess)
                 .help("Re-run cropping on the last scan with the current settings — no rescan")
+
+                Button {
+                    if model.unsavedCount > 0 {
+                        confirmingClear = true
+                    } else {
+                        model.clearAll()
+                    }
+                } label: {
+                    Label("Clear", systemImage: "xmark.bin")
+                        .labelStyle(.titleAndIcon)
+                }
+                .disabled(model.photos.isEmpty || model.busy)
+                .help("Empty the grid and the pending buffer (saved files are kept)")
+                .confirmationDialog(
+                    "Discard \(model.unsavedCount) unsaved photo\(model.unsavedCount > 1 ? "s" : "")?",
+                    isPresented: $confirmingClear) {
+                    Button("Discard", role: .destructive) { model.clearAll() }
+                } message: {
+                    Text("They were never written to disk and cannot be recovered.")
+                }
 
                 Button {
                     model.saveAll()
@@ -133,7 +154,14 @@ struct SettingsPane: View {
                         .truncationMode(.head)
                         .help(model.outputDirectory.path)
                 }
-                Button("Choose…") { model.chooseOutputDirectory() }
+                HStack {
+                    Button("Choose…") { model.chooseOutputDirectory() }
+                    Button {
+                        model.revealOutputFolder()
+                    } label: {
+                        Label("Open in Finder", systemImage: "folder")
+                    }
+                }
                 Toggle("Auto-save incoming scans", isOn: $model.autoSave)
                     .help("Write files as soon as a scan is processed — for hands-off watch sessions")
                 Slider(value: $model.quality, in: 0.5...1.0) {
@@ -226,6 +254,7 @@ struct PhotoCell: View {
     @EnvironmentObject var model: ScanModel
     let photo: PendingPhoto
     @State private var showingInfo = false
+    @State private var cropContext: CropEditingContext?
 
     var body: some View {
         VStack(spacing: 6) {
@@ -237,6 +266,20 @@ struct PhotoCell: View {
                 .shadow(radius: 2)
                 .overlay(alignment: .topTrailing) {
                     HStack(spacing: 4) {
+                        if model.canEditCrop(photo) {
+                            Button {
+                                cropContext = model.beginCropEdit(photo)
+                            } label: {
+                                Image(systemName: "crop")
+                            }
+                            .help("Adjust the crop on the scanned page")
+                            .sheet(item: $cropContext) { context in
+                                CropEditorView(context: context) { rect in
+                                    model.applyCropEdit(photoID: context.id,
+                                                        page: context.page, rect: rect)
+                                }
+                            }
+                        }
                         if photo.savedURL == nil {
                             Button {
                                 showingInfo = true
@@ -326,6 +369,160 @@ struct PhotoInfoPopover: View {
         }
         .padding(12)
         .frame(width: 280)
+    }
+}
+
+// MARK: - Crop editor
+
+/// The scanned page with the photo's rectangle over it: drag the corners to
+/// resize, drag the inside to move. Apply re-crops from the full-resolution
+/// page, taking the frame literally (no tightening, no auto-rotation).
+struct CropEditorView: View {
+    let context: CropEditingContext
+    let onApply: (CGRect) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var rect: CGRect
+    @State private var dragStart: CGRect?
+
+    private var pageSize: CGSize {
+        CGSize(width: context.page.width, height: context.page.height)
+    }
+
+    init(context: CropEditingContext, onApply: @escaping (CGRect) -> Void) {
+        self.context = context
+        self.onApply = onApply
+        _rect = State(initialValue: context.rect)
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            GeometryReader { geo in
+                let scale = min(geo.size.width / pageSize.width,
+                                geo.size.height / pageSize.height)
+                let shown = CGSize(width: pageSize.width * scale,
+                                   height: pageSize.height * scale)
+                let origin = CGPoint(x: (geo.size.width - shown.width) / 2,
+                                     y: (geo.size.height - shown.height) / 2)
+                let viewRect = CGRect(x: origin.x + rect.minX * scale,
+                                      y: origin.y + rect.minY * scale,
+                                      width: rect.width * scale,
+                                      height: rect.height * scale)
+
+                ZStack(alignment: .topLeading) {
+                    Image(decorative: context.page, scale: 1)
+                        .resizable()
+                        .frame(width: shown.width, height: shown.height)
+                        .offset(x: origin.x, y: origin.y)
+
+                    // Dim everything outside the crop.
+                    Path { path in
+                        path.addRect(CGRect(x: origin.x, y: origin.y,
+                                            width: shown.width, height: shown.height))
+                        path.addRect(viewRect)
+                    }
+                    .fill(Color.black.opacity(0.45), style: FillStyle(eoFill: true))
+
+                    Rectangle()
+                        .strokeBorder(Color.accentColor, lineWidth: 2)
+                        .frame(width: viewRect.width, height: viewRect.height)
+                        .offset(x: viewRect.minX, y: viewRect.minY)
+                        .contentShape(Rectangle())
+                        .gesture(moveGesture(scale: scale))
+
+                    ForEach(corners, id: \.name) { corner in
+                        Circle()
+                            .fill(Color.accentColor)
+                            .frame(width: 14, height: 14)
+                            .overlay(Circle().strokeBorder(.white, lineWidth: 2))
+                            // A generous invisible hit zone around the dot.
+                            .frame(width: 36, height: 36)
+                            .contentShape(Circle())
+                            .position(x: viewRect.minX + corner.unit.x * viewRect.width,
+                                      y: viewRect.minY + corner.unit.y * viewRect.height)
+                            .gesture(cornerGesture(corner, scale: scale))
+                    }
+                }
+            }
+
+            HStack {
+                Text("\(Int(rect.width))×\(Int(rect.height)) px")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Apply") {
+                    onApply(rect)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        // Sheets size to their content's ideal size: claim most of the
+        // screen so the page is workable, while staying user-resizable.
+        .frame(minWidth: 720, idealWidth: idealSheetSize.width, maxWidth: .infinity,
+               minHeight: 540, idealHeight: idealSheetSize.height, maxHeight: .infinity)
+    }
+
+    private var idealSheetSize: CGSize {
+        let visible = NSScreen.main?.visibleFrame.size ?? CGSize(width: 1440, height: 900)
+        return CGSize(width: visible.width * 0.85, height: visible.height * 0.82)
+    }
+
+    // MARK: Gestures
+
+    private struct Corner {
+        let name: String
+        let unit: CGPoint  // (0,0) top-left … (1,1) bottom-right
+    }
+
+    private var corners: [Corner] {
+        [Corner(name: "tl", unit: CGPoint(x: 0, y: 0)),
+         Corner(name: "tr", unit: CGPoint(x: 1, y: 0)),
+         Corner(name: "bl", unit: CGPoint(x: 0, y: 1)),
+         Corner(name: "br", unit: CGPoint(x: 1, y: 1))]
+    }
+
+    private func cornerGesture(_ corner: Corner, scale: CGFloat) -> some Gesture {
+        DragGesture()
+            .onChanged { value in
+                let start = dragStart ?? rect
+                dragStart = start
+                let dx = value.translation.width / scale
+                let dy = value.translation.height / scale
+                let minSide: CGFloat = 40
+                var minX = start.minX, maxX = start.maxX
+                var minY = start.minY, maxY = start.maxY
+                if corner.unit.x == 0 {
+                    minX = min(max(0, start.minX + dx), maxX - minSide)
+                } else {
+                    maxX = max(min(pageSize.width, start.maxX + dx), minX + minSide)
+                }
+                if corner.unit.y == 0 {
+                    minY = min(max(0, start.minY + dy), maxY - minSide)
+                } else {
+                    maxY = max(min(pageSize.height, start.maxY + dy), minY + minSide)
+                }
+                rect = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+            }
+            .onEnded { _ in dragStart = nil }
+    }
+
+    private func moveGesture(scale: CGFloat) -> some Gesture {
+        DragGesture()
+            .onChanged { value in
+                let start = dragStart ?? rect
+                dragStart = start
+                let dx = value.translation.width / scale
+                let dy = value.translation.height / scale
+                let x = min(max(0, start.minX + dx), pageSize.width - start.width)
+                let y = min(max(0, start.minY + dy), pageSize.height - start.height)
+                rect = CGRect(x: x, y: y, width: start.width, height: start.height)
+            }
+            .onEnded { _ in dragStart = nil }
     }
 }
 

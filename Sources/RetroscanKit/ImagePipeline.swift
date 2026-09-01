@@ -67,6 +67,10 @@ public struct ImageMetadata {
 public struct CroppedImage {
     public let image: CGImage
     public let method: String  // "document", "photo", "trim" or "none"
+    /// Axis-aligned rectangle this crop occupies on the scanned page (pixel
+    /// coordinates), when the crop is a plain rect — lets a UI re-crop from
+    /// the source page. Nil for perspective-corrected outputs.
+    public let sourceRect: CGRect?
 }
 
 public enum PipelineError: Error, CustomStringConvertible {
@@ -91,15 +95,17 @@ public func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?
         throw PipelineError.decodeFailed
     }
 
+    let pageRect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+
     switch crop {
     case .none:
-        return [CroppedImage(image: image, method: "none")]
+        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
 
     case .document:
         if let doc = detectAndCropDocument(image) {
-            return [CroppedImage(image: doc, method: "document")]
+            return [CroppedImage(image: doc, method: "document", sourceRect: nil)]
         }
-        return [CroppedImage(image: image, method: "none")]
+        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
 
     case .photos:
         let (regions, background) = detectContentRegions(image)
@@ -107,13 +113,13 @@ public func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?
             let sam = encodedSAM(sam, image)
             return regions.compactMap { cropRegion(image, $0, background: background, sam: sam) }
         }
-        return [CroppedImage(image: image, method: "none")]
+        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
 
     case .trim:
-        if let trimmed = trimWhiteBorders(image) {
-            return [CroppedImage(image: trimmed, method: "trim")]
+        if let (trimmed, rect) = trimWhiteBorders(image) {
+            return [CroppedImage(image: trimmed, method: "trim", sourceRect: rect)]
         }
-        return [CroppedImage(image: image, method: "none")]
+        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
 
     case .auto:
         let (regions, background) = detectContentRegions(image)
@@ -132,12 +138,12 @@ public func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?
             return [cropped]
         }
         if let doc = detectAndCropDocument(image) {
-            return [CroppedImage(image: doc, method: "document")]
+            return [CroppedImage(image: doc, method: "document", sourceRect: nil)]
         }
-        if let trimmed = trimWhiteBorders(image) {
-            return [CroppedImage(image: trimmed, method: "trim")]
+        if let (trimmed, rect) = trimWhiteBorders(image) {
+            return [CroppedImage(image: trimmed, method: "trim", sourceRect: rect)]
         }
-        return [CroppedImage(image: image, method: "none")]
+        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
     }
 }
 
@@ -545,15 +551,19 @@ private func cropRegion(_ image: CGImage, _ region: CGRect, background: Int,
     // there is no background to separate and SAM would segment inside it.
     let pageArea = Double(image.width * image.height)
     let regionIsWholePage = Double(region.width * region.height) > pageArea * 0.9
-    if let sam, !regionIsWholePage, let refined = try? sam.refine(region: region),
-       let cropped = image.cropping(to: tightenRect(image, refined, background: background)) {
-        return CroppedImage(image: cropped, method: "photo (SAM)")
+    if let sam, !regionIsWholePage, let refined = try? sam.refine(region: region) {
+        let rect = tightenRect(image, refined, background: background)
+        if let cropped = image.cropping(to: rect) {
+            return CroppedImage(image: cropped, method: "photo (SAM)", sourceRect: rect)
+        }
     }
     if let snapped = snapToRectangle(image, around: region) {
-        return CroppedImage(image: snapped, method: "photo (edges)")
+        // Perspective-corrected: the coarse region is only a seed for re-crops.
+        return CroppedImage(image: snapped, method: "photo (edges)", sourceRect: region)
     }
-    return image.cropping(to: tightenRect(image, region, background: background))
-        .map { CroppedImage(image: $0, method: "photo (bbox)") }
+    let rect = tightenRect(image, region, background: background)
+    return image.cropping(to: rect)
+        .map { CroppedImage(image: $0, method: "photo (bbox)", sourceRect: rect) }
 }
 
 // MARK: - Edge tightening
@@ -634,7 +644,7 @@ private func tightenRect(_ image: CGImage, _ rect: CGRect, background: Int) -> C
 // MARK: - White-border trim fallback
 
 /// Crops to the bounding box of all non-white content (plus a small margin).
-private func trimWhiteBorders(_ image: CGImage) -> CGImage? {
+private func trimWhiteBorders(_ image: CGImage) -> (CGImage, CGRect)? {
     guard let (mask, scale, _) = contentMask(image, maxDim: 800, threshold: 246) else { return nil }
     let w = mask.width, h = mask.height
     // A row/column counts as content when >0.5% of its pixels are dark,
@@ -672,7 +682,7 @@ private func trimWhiteBorders(_ image: CGImage) -> CGImage? {
     // Not worth cropping for less than a 2% reduction.
     let full = Double(image.width * image.height)
     guard rect.width * rect.height < full * 0.98 else { return nil }
-    return image.cropping(to: rect)
+    return image.cropping(to: rect).map { ($0, rect) }
 }
 
 // MARK: - Orientation

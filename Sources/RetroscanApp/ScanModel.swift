@@ -30,6 +30,18 @@ struct PendingPhoto: Identifiable {
     let dpi: Int
     let scannerModel: String?
     var savedURL: URL?
+    /// Where this crop sits on its scanned page — lets the crop be adjusted
+    /// by hand while that page's raw data is still around (the last scan).
+    var pageIndex: Int?
+    var sourceRect: CGRect?
+}
+
+/// Everything the crop editor sheet needs: the full-resolution page and the
+/// photo's current rectangle on it.
+struct CropEditingContext: Identifiable {
+    let id: UUID  // the photo's id
+    let page: CGImage
+    let rect: CGRect
 }
 
 /// UI state and orchestration. The kit's calls are all blocking, so scanner
@@ -90,6 +102,8 @@ final class ScanModel: ObservableObject {
     private var listener: PushScanListener?
     private var sam: SAMDetector?
     private var lastBatch: (id: UUID, pages: [Data], pageURLs: [URL], dpi: Int, model: String?)?
+    /// Raw pages kept on disk per batch, while any of its photos is unsaved.
+    private var batches: [UUID: SessionManifest.Batch] = [:]
     /// Holds the spilled full-resolution PNGs, thumbnails and last-scan raw
     /// pages of the unsaved session, plus its manifest — a stable location,
     /// so quitting the app (or crashing) loses nothing: the pending grid is
@@ -192,6 +206,8 @@ final class ScanModel: ObservableObject {
             var method: String
             var dpi: Int
             var scannerModel: String?
+            var pageIndex: Int?
+            var sourceRect: [Double]?
         }
         struct Batch: Codable {
             var id: UUID
@@ -200,6 +216,12 @@ final class ScanModel: ObservableObject {
             var model: String?
         }
         var photos: [Photo]
+        /// Every batch whose raw pages are still in the pending dir — kept
+        /// as long as one of its photos is unsaved, so any pending crop can
+        /// be re-adjusted from its source page.
+        var batches: [Batch]?
+        var lastBatchID: UUID?
+        /// Legacy single-batch field (pre-`batches` manifests).
         var lastBatch: Batch?
     }
 
@@ -220,13 +242,14 @@ final class ScanModel: ObservableObject {
                     captionOverride: photo.captionOverride,
                     pixelWidth: photo.pixelWidth, pixelHeight: photo.pixelHeight,
                     method: photo.method, dpi: photo.dpi,
-                    scannerModel: photo.scannerModel)
+                    scannerModel: photo.scannerModel,
+                    pageIndex: photo.pageIndex,
+                    sourceRect: photo.sourceRect.map {
+                        [$0.minX, $0.minY, $0.width, $0.height]
+                    })
             },
-            lastBatch: lastBatch.map {
-                SessionManifest.Batch(id: $0.id,
-                                      pageNames: $0.pageURLs.map(\.lastPathComponent),
-                                      dpi: $0.dpi, model: $0.model)
-            })
+            batches: Array(batches.values),
+            lastBatchID: lastBatch?.id)
         if let data = try? JSONEncoder().encode(manifest) {
             try? data.write(to: manifestURL)
         }
@@ -258,14 +281,27 @@ final class ScanModel: ObservableObject {
                 captionOverride: entry.captionOverride,
                 pixelWidth: entry.pixelWidth, pixelHeight: entry.pixelHeight,
                 method: entry.method, dpi: entry.dpi,
-                scannerModel: entry.scannerModel))
+                scannerModel: entry.scannerModel,
+                pageIndex: entry.pageIndex,
+                sourceRect: entry.sourceRect.flatMap {
+                    $0.count == 4 ? CGRect(x: $0[0], y: $0[1], width: $0[2], height: $0[3]) : nil
+                }))
         }
-        if let batch = manifest.lastBatch {
+        let storedBatches = manifest.batches ?? manifest.lastBatch.map { [$0] } ?? []
+        for batch in storedBatches {
+            let present = batch.pageNames.allSatisfy {
+                FileManager.default.fileExists(atPath: pendingDir.appendingPathComponent($0).path)
+            }
+            guard present, !batch.pageNames.isEmpty else { continue }
+            batches[batch.id] = batch
+            batch.pageNames.forEach { referenced.insert($0) }
+        }
+        if let lastID = manifest.lastBatchID ?? manifest.lastBatch?.id,
+           let batch = batches[lastID] {
             let urls = batch.pageNames.map { pendingDir.appendingPathComponent($0) }
             let pages = urls.compactMap { try? Data(contentsOf: $0) }
-            if pages.count == urls.count, !pages.isEmpty {
+            if pages.count == urls.count {
                 lastBatch = (batch.id, pages, urls, batch.dpi, batch.model)
-                batch.pageNames.forEach { referenced.insert($0) }
             }
         }
         // Anything in the pending dir the manifest doesn't reference is a
@@ -419,6 +455,7 @@ final class ScanModel: ObservableObject {
         photos.removeAll { $0.id == photo.id }
         try? FileManager.default.removeItem(at: photo.fullResURL)
         try? FileManager.default.removeItem(at: photo.thumbURL)
+        cleanupBatches()
         persistSession()
     }
 
@@ -455,15 +492,91 @@ final class ScanModel: ObservableObject {
             })
     }
 
+    /// A crop is adjustable while the photo is unsaved and its source page
+    /// is still in the pending dir — pages are kept per batch until every
+    /// photo of the batch is saved or discarded.
+    func canEditCrop(_ photo: PendingPhoto) -> Bool {
+        photo.savedURL == nil && photo.sourceRect != nil
+            && photo.pageIndex != nil && batches[photo.batch] != nil
+    }
+
+    /// Decodes the photo's source page for the crop editor sheet.
+    func beginCropEdit(_ photo: PendingPhoto) -> CropEditingContext? {
+        guard canEditCrop(photo),
+              let index = photo.pageIndex, let rect = photo.sourceRect else { return nil }
+        let pageData: Data
+        if let last = lastBatch, last.id == photo.batch, index < last.pages.count {
+            pageData = last.pages[index]
+        } else if let batch = batches[photo.batch], index < batch.pageNames.count,
+                  let data = try? Data(contentsOf:
+                      pendingDir.appendingPathComponent(batch.pageNames[index])) {
+            pageData = data
+        } else {
+            return nil
+        }
+        guard let source = CGImageSourceCreateWithData(pageData as CFData, nil),
+              let page = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return CropEditingContext(id: photo.id, page: page, rect: rect)
+    }
+
+    /// Replaces the photo with a plain crop of the adjusted rectangle. The
+    /// manual frame is taken literally (no tightening); the photo's rotation
+    /// is kept, since it lives in quarterTurns, not in the stored image.
+    func applyCropEdit(photoID: UUID, page: CGImage, rect: CGRect) {
+        guard let i = photos.firstIndex(where: { $0.id == photoID }) else { return }
+        let bounded = rect.integral.intersection(
+            CGRect(x: 0, y: 0, width: page.width, height: page.height))
+        guard bounded.width >= 20, bounded.height >= 20,
+              let image = page.cropping(to: bounded) else { return }
+        let old = photos[i]
+        workQueue.async {
+            do {
+                let name = UUID().uuidString
+                let fullURL = self.pendingDir.appendingPathComponent("\(name).png")
+                let thumbURL = self.pendingDir.appendingPathComponent("\(name)-thumb.png")
+                try self.writePNG(image, to: fullURL)
+                var thumbnail = self.downscaled(image, maxDim: 640) ?? image
+                try self.writePNG(thumbnail, to: thumbURL)
+                for _ in 0..<(old.quarterTurns % 4) { thumbnail = rotated(thumbnail, .right) }
+                DispatchQueue.main.async {
+                    guard let i = self.photos.firstIndex(where: { $0.id == photoID }) else { return }
+                    try? FileManager.default.removeItem(at: old.fullResURL)
+                    try? FileManager.default.removeItem(at: old.thumbURL)
+                    let photo = self.photos[i]
+                    let upright = photo.quarterTurns % 2 == 1
+                    self.photos[i] = PendingPhoto(
+                        id: photo.id, batch: photo.batch,
+                        thumbnail: thumbnail,
+                        fullResURL: fullURL, thumbURL: thumbURL,
+                        quarterTurns: photo.quarterTurns,
+                        dateOverride: photo.dateOverride,
+                        captionOverride: photo.captionOverride,
+                        pixelWidth: upright ? image.height : image.width,
+                        pixelHeight: upright ? image.width : image.height,
+                        method: "manual", dpi: photo.dpi,
+                        scannerModel: photo.scannerModel,
+                        pageIndex: photo.pageIndex,
+                        sourceRect: bounded)
+                    self.persistSession()
+                }
+            } catch {
+                self.finish(with: error)
+            }
+        }
+    }
+
     func clearAll() {
         for photo in photos {
             try? FileManager.default.removeItem(at: photo.fullResURL)
             try? FileManager.default.removeItem(at: photo.thumbURL)
         }
         photos.removeAll()
-        if let batch = lastBatch {
-            batch.pageURLs.forEach { try? FileManager.default.removeItem(at: $0) }
+        for batch in batches.values {
+            for name in batch.pageNames {
+                try? FileManager.default.removeItem(at: pendingDir.appendingPathComponent(name))
+            }
         }
+        batches.removeAll()
         lastBatch = nil
         persistSession()
     }
@@ -499,6 +612,14 @@ final class ScanModel: ObservableObject {
 
     // MARK: - Saving
 
+    /// Opens the output folder in the Finder (creating it if needed, so the
+    /// button works before the first save).
+    func revealOutputFolder() {
+        try? FileManager.default.createDirectory(at: outputDirectory,
+                                                 withIntermediateDirectories: true)
+        NSWorkspace.shared.open(outputDirectory)
+    }
+
     func chooseOutputDirectory() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -526,6 +647,7 @@ final class ScanModel: ObservableObject {
                             self.photos[i].savedURL = saved.savedURL
                         }
                     }
+                    self.cleanupBatches()
                     self.persistSession()
                     self.busy = false
                     self.status = "Saved to \(settings.outDir.path)"
@@ -622,12 +744,19 @@ final class ScanModel: ObservableObject {
         setStatus("Processing…")
         let batchID = UUID()
         var newPhotos: [PendingPhoto] = []
-        for page in pages {
+        for (pageIndex, page) in pages.enumerated() {
             for cropped in try extractImages(from: page, crop: settings.crop, sam: sam) {
                 var image = cropped.image
                 var method = cropped.method
+                // Rotation is never baked into the stored image: it lives in
+                // quarterTurns (auto-rotation seeds it, the rotate button
+                // adjusts it), applied to the thumbnail for display and to
+                // the full image at save. The spill stays in page
+                // orientation, so a re-crop composes with rotation instead
+                // of losing it.
+                var turns = 0
                 if settings.autoRotate, let o = detectUprightOrientation(image), o != .up {
-                    image = rotated(image, o)
+                    turns = quarterTurns(for: o)
                     method += ", rotated \(degrees(o))°"
                 }
                 if settings.grayscale, let gray = convertToGrayscale(image) {
@@ -637,12 +766,18 @@ final class ScanModel: ObservableObject {
                 let fullURL = pendingDir.appendingPathComponent("\(name).png")
                 let thumbURL = pendingDir.appendingPathComponent("\(name)-thumb.png")
                 try writePNG(image, to: fullURL)
-                let thumbnail = downscaled(image, maxDim: 640) ?? image
+                var thumbnail = downscaled(image, maxDim: 640) ?? image
                 try writePNG(thumbnail, to: thumbURL)
+                for _ in 0..<turns { thumbnail = rotated(thumbnail, .right) }
+                let upright = turns % 2 == 1
                 newPhotos.append(PendingPhoto(batch: batchID, thumbnail: thumbnail,
                                               fullResURL: fullURL, thumbURL: thumbURL,
-                                              pixelWidth: image.width, pixelHeight: image.height,
-                                              method: method, dpi: dpi, scannerModel: model))
+                                              quarterTurns: turns,
+                                              pixelWidth: upright ? image.height : image.width,
+                                              pixelHeight: upright ? image.width : image.height,
+                                              method: method, dpi: dpi, scannerModel: model,
+                                              pageIndex: pageIndex,
+                                              sourceRect: cropped.sourceRect))
             }
         }
         // The raw pages are spilled too, so Re-process still works after a
@@ -657,12 +792,25 @@ final class ScanModel: ObservableObject {
             try save(&newPhotos, settings: settings)
         }
         DispatchQueue.main.async {
-            if let previous = self.lastBatch {
-                previous.pageURLs.forEach { try? FileManager.default.removeItem(at: $0) }
-            }
             self.lastBatch = (batchID, pages, pageURLs, dpi, model)
+            self.batches[batchID] = SessionManifest.Batch(
+                id: batchID, pageNames: pageURLs.map(\.lastPathComponent),
+                dpi: dpi, model: model)
             self.photos.append(contentsOf: newPhotos)
+            self.cleanupBatches()
             self.persistSession()
+        }
+    }
+
+    /// Drops the raw pages of batches nothing pending references any more
+    /// (the last batch is kept regardless, for Re-process).
+    private func cleanupBatches() {
+        let live = Set(photos.filter { $0.savedURL == nil }.map(\.batch))
+        for (id, batch) in batches where id != lastBatch?.id && !live.contains(id) {
+            for name in batch.pageNames {
+                try? FileManager.default.removeItem(at: pendingDir.appendingPathComponent(name))
+            }
+            batches.removeValue(forKey: id)
         }
     }
 
@@ -723,6 +871,15 @@ final class ScanModel: ObservableObject {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? encoder.encode(album) {
             try? data.write(to: albumURL)
+        }
+    }
+
+    private func quarterTurns(for orientation: CGImagePropertyOrientation) -> Int {
+        switch orientation {
+        case .right: return 1
+        case .down: return 2
+        case .left: return 3
+        default: return 0
         }
     }
 
