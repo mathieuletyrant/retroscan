@@ -145,8 +145,8 @@ extension ScanModel {
     // MARK: Re-process
 
     /// Re-runs crop/rotate with the current settings on the last scan's raw
-    /// pages — no need to rescan to try another crop strategy. The batch's
-    /// existing files move to the Trash and fresh ones are written.
+    /// pages — no need to rescan to try other settings. The batch's existing
+    /// files move to the Trash and fresh ones are written.
     func reprocessLastScan() {
         guard !busy, !watching, let last = lastBatch else { return }
         busy = true
@@ -198,7 +198,7 @@ extension ScanModel {
         let batchID = existingBatch?.id ?? UUID()
         var items: [ProcessedImage] = []
         for (pageIndex, page) in pages.enumerated() {
-            for cropped in try extractImages(from: page, crop: settings.crop) {
+            for cropped in try extractImages(from: page, splitPhotos: settings.splitPhotos) {
                 var image = cropped.image
                 var method = cropped.method
                 // Rotation is baked into the saved JPEG at write time;

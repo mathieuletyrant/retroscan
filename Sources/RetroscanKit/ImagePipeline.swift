@@ -5,14 +5,6 @@ import ImageIO
 import Vision
 import UniformTypeIdentifiers
 
-public enum CropStrategy: String, CaseIterable {
-    case auto      // several photos -> split; one document -> perspective crop; else trim
-    case document  // Vision document detection only, single output
-    case photos    // always split into per-photo images
-    case trim      // white-border trim only
-    case none
-}
-
 /// When the photo itself was taken (for scanned prints), as opposed to when
 /// it was scanned. Missing month/day default to January 1st.
 public struct ContentDate {
@@ -66,11 +58,11 @@ public struct ImageMetadata {
 
 public struct CroppedImage {
     public let image: CGImage
-    public let method: String  // "document", "photo", "trim" or "none"
+    public let method: String  // "photo (edges)", "photo (bbox)" or "none"
     /// Axis-aligned rectangle this crop occupies on the scanned page (pixel
-    /// coordinates), when the crop is a plain rect — lets a UI re-crop from
-    /// the source page. Nil for perspective-corrected outputs.
-    public let sourceRect: CGRect?
+    /// coordinates) — lets a UI re-crop from the source page. For a
+    /// perspective-corrected output it is the region the crop came from.
+    public let sourceRect: CGRect
 }
 
 public enum PipelineError: Error, CustomStringConvertible {
@@ -87,88 +79,21 @@ public enum PipelineError: Error, CustomStringConvertible {
 
 private let ciContext = CIContext()
 
-/// Applies the crop strategy to one scanned page. May return several images
-/// (e.g. multiple photos laid out on the flatbed).
-public func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage] {
+/// Turns one scanned page into the images to save: one tight crop per print
+/// laid on the bed, or the page as scanned when `splitPhotos` is off (or
+/// when nothing print-shaped is found on it).
+public func extractImages(from jpeg: Data, splitPhotos: Bool) throws -> [CroppedImage] {
     guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
           let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         throw PipelineError.decodeFailed
     }
-
-    let pageRect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
-
-    switch crop {
-    case .none:
-        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
-
-    case .document:
-        if let doc = detectAndCropDocument(image) {
-            return [CroppedImage(image: doc, method: "document", sourceRect: nil)]
-        }
-        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
-
-    case .photos:
-        let (regions, background) = detectContentRegions(image)
-        if !regions.isEmpty {
-            return regions.compactMap { cropRegion(image, $0, background: background) }
-        }
-        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
-
-    case .trim:
-        if let (trimmed, rect) = trimWhiteBorders(image) {
-            return [CroppedImage(image: trimmed, method: "trim", sourceRect: rect)]
-        }
-        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
-
-    case .auto:
-        let (regions, background) = detectContentRegions(image)
-        if regions.count >= 2 {
-            return regions.compactMap { cropRegion(image, $0, background: background) }
-        }
-        // A lone region that isn't the whole page is a single photo: give it
-        // the same treatment as one photo among several. (A region covering
-        // ~everything is an already-cropped image; leave it to the document
-        // and trim fallbacks.)
-        if let region = regions.first,
-           Double(region.width * region.height) < Double(image.width * image.height) * 0.9,
-           let cropped = cropRegion(image, region, background: background) {
-            return [cropped]
-        }
-        if let doc = detectAndCropDocument(image) {
-            return [CroppedImage(image: doc, method: "document", sourceRect: nil)]
-        }
-        if let (trimmed, rect) = trimWhiteBorders(image) {
-            return [CroppedImage(image: trimmed, method: "trim", sourceRect: rect)]
-        }
-        return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
-    }
-}
-
-// MARK: - Document detection (Vision)
-
-private func detectAndCropDocument(_ image: CGImage) -> CGImage? {
-    let request = VNDetectDocumentSegmentationRequest()
-    let handler = VNImageRequestHandler(cgImage: image, options: [:])
-    guard (try? handler.perform([request])) != nil,
-          let observation = request.results?.first,
-          observation.confidence > 0.5 else { return nil }
-
-    let w = CGFloat(image.width)
-    let h = CGFloat(image.height)
-    let box = observation.boundingBox
-    // Ignore implausible detections: near-nothing or the whole bed.
-    guard box.width * box.height > 0.02, box.width * box.height < 0.98 else { return nil }
-
-    func scaled(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x * w, y: p.y * h) }
-
-    let input = CIImage(cgImage: image)
-    let corrected = input.applyingFilter("CIPerspectiveCorrection", parameters: [
-        "inputTopLeft": CIVector(cgPoint: scaled(observation.topLeft)),
-        "inputTopRight": CIVector(cgPoint: scaled(observation.topRight)),
-        "inputBottomLeft": CIVector(cgPoint: scaled(observation.bottomLeft)),
-        "inputBottomRight": CIVector(cgPoint: scaled(observation.bottomRight)),
-    ])
-    return ciContext.createCGImage(corrected, from: corrected.extent)
+    let page = [CroppedImage(image: image, method: "none",
+                             sourceRect: CGRect(x: 0, y: 0,
+                                                width: image.width, height: image.height))]
+    guard splitPhotos else { return page }
+    let (regions, background) = detectContentRegions(image)
+    guard !regions.isEmpty else { return page }
+    return regions.compactMap { cropRegion(image, $0, background: background) }
 }
 
 // MARK: - Content region detection (multiple photos on the bed)
@@ -286,7 +211,7 @@ private func dilate(_ mask: Mask, radius: Int) -> Mask {
 }
 
 /// Finds bounding boxes (in full-resolution pixels) of distinct content
-/// regions large enough to be photos/documents.
+/// regions large enough to be prints.
 private func detectContentRegions(_ image: CGImage) -> (regions: [CGRect], background: Int) {
     guard let (rawMask, scale, background) = contentMask(image, maxDim: 600, threshold: 246) else {
         return ([], 255)
@@ -330,14 +255,14 @@ private func detectContentRegions(_ image: CGImage) -> (regions: [CGRect], backg
         }
     }
 
-    // A real photo/document fills a meaningful part of the bed and is
-    // reasonably solid (area vs. bounding box), unlike streaks or dust.
+    // A real print fills a meaningful part of the bed and is reasonably
+    // solid (area vs. bounding box), unlike streaks or dust.
     let pageArea = Double(w * h)
     let inv = 1.0 / scale
     let margin = 2.0 // full-resolution pixels; keep crops tight
 
-    // Nothing narrower than ~4% of the page in either direction is a photo
-    // or document — that filters out glass-edge shadows and fold lines.
+    // Nothing narrower than ~4% of the page in either direction is a print
+    // — that filters out glass-edge shadows and fold lines.
     let minSide = max(w, h) * 4 / 100
 
     var rects: [CGRect] = []
@@ -605,50 +530,6 @@ private func tightenRect(_ image: CGImage, _ rect: CGRect, background: Int) -> C
         height: rect.height - Double(top + bottom) * inv - bite * 2)
     tightened = tightened.intersection(rect)
     return (tightened.width > 40 && tightened.height > 40) ? tightened : rect
-}
-
-// MARK: - White-border trim fallback
-
-/// Crops to the bounding box of all non-white content (plus a small margin).
-private func trimWhiteBorders(_ image: CGImage) -> (CGImage, CGRect)? {
-    guard let (mask, scale, _) = contentMask(image, maxDim: 800, threshold: 246) else { return nil }
-    let w = mask.width, h = mask.height
-    // A row/column counts as content when >0.5% of its pixels are dark,
-    // which keeps single specks of dust from defeating the trim.
-    let rowMinDark = max(2, w / 200)
-    let colMinDark = max(2, h / 200)
-
-    var top = -1, bottom = -1, left = -1, right = -1
-    for y in 0..<h {
-        var dark = 0
-        for x in 0..<w where mask.bits[y * w + x] { dark += 1 }
-        if dark >= rowMinDark {
-            if top < 0 { top = y }
-            bottom = y
-        }
-    }
-    guard top >= 0 else { return nil }
-    for x in 0..<w {
-        var dark = 0
-        for y in 0..<h where mask.bits[y * w + x] { dark += 1 }
-        if dark >= colMinDark {
-            if left < 0 { left = x }
-            right = x
-        }
-    }
-    guard left >= 0 else { return nil }
-
-    let inv = 1.0 / scale
-    let margin = Double(12)
-    var rect = CGRect(x: Double(left) * inv - margin,
-                      y: Double(top) * inv - margin,
-                      width: Double(right - left + 1) * inv + margin * 2,
-                      height: Double(bottom - top + 1) * inv + margin * 2)
-    rect = rect.intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
-    // Not worth cropping for less than a 2% reduction.
-    let full = Double(image.width * image.height)
-    guard rect.width * rect.height < full * 0.98 else { return nil }
-    return image.cropping(to: rect).map { ($0, rect) }
 }
 
 // MARK: - Orientation

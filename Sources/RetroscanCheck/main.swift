@@ -39,13 +39,16 @@ func page(background: UInt8, foreground: UInt8) -> Data {
 
 func regionCount(background: UInt8, foreground: UInt8) -> Int {
     (try? extractImages(from: page(background: background, foreground: foreground),
-                        crop: .photos))?.count ?? 0
+                        splitPhotos: true))?.count ?? 0
 }
 
 // Bare white bed, then a dark backing sheet: both must yield two photos.
 // The dark case only works if the background estimate follows the backing.
 check("two photos on a white bed", regionCount(background: 255, foreground: 90) == 2)
 check("two photos on dark backing", regionCount(background: 40, foreground: 200) == 2)
+check("no-crop keeps the page whole",
+      (try? extractImages(from: page(background: 255, foreground: 90),
+                          splitPhotos: false))?.count == 1)
 
 let ctx = CGContext(data: nil, width: 40, height: 20, bitsPerComponent: 8,
                     bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),

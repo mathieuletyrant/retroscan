@@ -70,7 +70,7 @@ final class ScanModel: ObservableObject {
     // Scan settings
     @Published var resolution = 300 { didSet { persistDefaults() } }
     @Published var grayscale = false { didSet { persistDefaults() } }
-    @Published var crop: CropStrategy = .auto { didSet { persistDefaults() } }
+    @Published var splitPhotos = true { didSet { persistDefaults() } }
     @Published var autoRotate = true { didSet { persistDefaults() } }
     @Published var quality = 0.92 { didSet { persistDefaults() } }
 
@@ -135,8 +135,8 @@ final class ScanModel: ObservableObject {
             .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? defaultDir
         if d.object(forKey: "resolution") != nil { resolution = d.integer(forKey: "resolution") }
         grayscale = d.bool(forKey: "grayscale")
-        if let raw = d.string(forKey: "crop"), let strategy = CropStrategy(rawValue: raw) {
-            crop = strategy
+        if d.object(forKey: "splitPhotos") != nil {
+            splitPhotos = d.bool(forKey: "splitPhotos")
         }
         if d.object(forKey: "autoRotate") != nil { autoRotate = d.bool(forKey: "autoRotate") }
         if d.object(forKey: "quality") != nil { quality = d.double(forKey: "quality") }
@@ -157,7 +157,7 @@ final class ScanModel: ObservableObject {
         d.set(outputDirectory.path, forKey: "outputDirectory")
         d.set(resolution, forKey: "resolution")
         d.set(grayscale, forKey: "grayscale")
-        d.set(crop.rawValue, forKey: "crop")
+        d.set(splitPhotos, forKey: "splitPhotos")
         d.set(autoRotate, forKey: "autoRotate")
         d.set(quality, forKey: "quality")
         d.set(author, forKey: "author")
@@ -170,7 +170,7 @@ final class ScanModel: ObservableObject {
     struct Settings {
         var resolution: Int
         var grayscale: Bool
-        var crop: CropStrategy
+        var splitPhotos: Bool
         var autoRotate: Bool
         var metadata: ImageMetadata
         var outDir: URL
@@ -197,7 +197,8 @@ final class ScanModel: ObservableObject {
             author: author.isEmpty ? nil : author,
             keywords: keywords.isEmpty ? nil : keywords,
             dateTaken: dateTaken.isEmpty ? nil : dateTaken)
-        return Settings(resolution: resolution, grayscale: grayscale, crop: crop,
+        return Settings(resolution: resolution, grayscale: grayscale,
+                        splitPhotos: splitPhotos,
                         autoRotate: autoRotate, metadata: metadata,
                         outDir: outputDirectory,
                         baseName: base.isEmpty ? "scan" : base,

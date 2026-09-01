@@ -1,8 +1,13 @@
 # 📸 retroscan
 
+I had boxes of family photo prints to digitize and no patience for feeding
+them to a scanner one print at a time. retroscan is what came out of it.
+
 A macOS CLI **and app** (Swift, zero dependencies, zero drivers) that scans
-from a networked Brother printer, auto-crops each photo, puts them upright,
-and embeds metadata — built for digitizing whole albums of old photo prints.
+from a networked Brother printer, cuts every print out of the page, puts
+faces upright and embeds the metadata: lay six prints on the glass, press
+the printer's own Scan button, get six tagged JPEGs in the album folder.
+Then do it again with the next six.
 
 Tested with a Brother MFC-1910W. Works with any Brother device exposing the
 `_scanner._tcp` Bonjour service (port 54921, the protocol behind the SANE
@@ -34,7 +39,8 @@ make check       # self-check the crop pipeline on synthetic pages (no scanner)
 `make app` installs **Retroscan.app**, a SwiftUI front-end to the same
 engine (both are thin layers over the `RetroscanKit` library target):
 
-- pick the scanner, resolution, crop strategy and album metadata in a sidebar
+- pick the scanner, resolution, crop/rotate toggles and album metadata in a
+  sidebar
 - every scan is **saved to the album immediately**, numbered like the CLI
   does — the grid shows the album, nothing is ever lost with the app closed
 - and **every photo stays editable**: adjust the crop by hand (the crop
@@ -43,9 +49,9 @@ engine (both are thin layers over the `RetroscanKit` library target):
   frame), rotate, or change the per-photo date/description (the ⓘ button);
   the JPEG is rewritten in place. The trash button moves a reject to the
   macOS Trash
-- **Re-process** re-runs cropping on the last scan with the current settings
-  (try another strategy without rescanning) — the batch's files are replaced,
-  the old ones go to the Trash
+- **Re-process** re-runs the last scan through the pipeline with the current
+  settings (change the crop or grayscale toggle without rescanning) — the
+  batch's files are replaced, the old ones go to the Trash
 - **Watch** registers on the printer's *Scan to PC* menu, like `retroscan
   watch` — a whole album digitizes without touching the Mac
 - every output folder is a **reopenable project**: a hidden `.retroscan.json`
@@ -61,11 +67,11 @@ engine (both are thin layers over the `RetroscanKit` library target):
 ## 🎯 Usage
 
 ```sh
-retroscan                          # color 300 dpi scan, auto-crop, current dir
+retroscan                          # 300 dpi color, one file per print, current dir
 retroscan --list                   # list scanners on the network
 retroscan -r 600 -m gray -o ~/Documents/Scans
 retroscan -t "Holidays 1995" -D 1995 -k photos,family -a "Mathieu"
-retroscan -c photos                # force one-file-per-photo splitting
+retroscan --no-crop                # keep the scanned page whole
 retroscan -R none                  # disable auto-rotation
 retroscan --input page.jpg         # re-run crop/rotate/metadata on an existing scan
 ```
@@ -96,15 +102,25 @@ whatever port you advertise. retroscan will tell you; free the port with
 `com.brother.LOGINserver` launch agent — remove that from
 `/Library/LaunchAgents/` for a permanent fix).
 
-## ✂️ What `auto` cropping does
+## ✂️ How cropping works
 
-1. Several photos on the bed → region detection (luminance + gradient
-   masks, connected components) and **one file per photo**, split along
-   any narrow bed-white seam when prints are laid almost touching.
-2. A single detected document → Vision perspective crop.
-3. Otherwise → plain white-border trim.
+There is one crop mode, and it is the one this tool exists for: every print
+found on the glass becomes its own tight file.
 
-Multiple pages from the ADF come out as `-p1`, `-p2`, … files.
+1. The page is reduced to a content mask — luminance **and** local gradient,
+   because a washed-out sky can scan brighter than the bed while its paper
+   edge is always a step. The background level is measured from the page
+   frame, so a dark backing sheet works as well as the bare white bed.
+2. Connected components become candidate regions, and any region crossed by
+   a narrow all-background seam is split again: prints laid almost touching
+   still come out separate.
+3. Each region is snapped to the print's true rectangle (Vision edge
+   detection, perspective-corrected) or, failing that, tightened until no
+   white paper border is left — losing a sliver of photo beats keeping a
+   white margin.
+
+Nothing print-shaped on the page? The scan is saved whole. `--no-crop` (in
+the app: the *Crop to one file per photo* toggle) skips detection entirely.
 
 ## 🔄 Auto-rotation
 

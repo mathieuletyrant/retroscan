@@ -32,10 +32,8 @@ OUTPUT
   -q, --quality <0-1>    JPEG quality                     (default: 0.92)
 
 CROP
-  -c, --crop <strategy>  auto | document | photos | trim | none   (default: auto)
-                         auto: several photos on the bed -> one file each;
-                         single document -> perspective crop; else trim borders
-                         photos: always split into per-photo files
+      --no-crop          Keep each scanned page whole. By default every print
+                         found on the glass comes out as its own tight file.
 
 ROTATION
   -R, --rotate <mode>    auto | none | 90 | 180 | 270     (default: auto)
@@ -53,7 +51,8 @@ METADATA (always embeds scan date, scanner model, DPI)
 
 EXAMPLES
   retroscan
-  retroscan -r 600 -m gray -t "Facture EDF" -k facture,edf,2026 -o ~/Documents/Scans
+  retroscan -t "Holidays 1995" -D 1995 -k family -o ~/Pictures/Albums/1995
+  retroscan watch -t "Holidays 1995" -D 1995 -o ~/Pictures/Albums/1995
 """
 
 func fail(_ message: String) -> Never {
@@ -73,7 +72,7 @@ struct Options {
     var grayscale = false
     var outDir = FileManager.default.currentDirectoryPath
     var baseName: String?
-    var crop = CropStrategy.auto
+    var splitPhotos = true
     var rotate = RotateOption.auto
     var quality = 0.92
     var title: String?
@@ -119,11 +118,7 @@ func parseOptions() -> Options {
                 fail("quality must be in (0, 1]")
             }
             opts.quality = q
-        case "-c", "--crop":
-            guard let c = CropStrategy(rawValue: value(for: arg)) else {
-                fail("crop must be auto, document, photos, trim or none")
-            }
-            opts.crop = c
+        case "--no-crop": opts.splitPhotos = false
         case "-R", "--rotate":
             switch value(for: arg) {
             case "auto": opts.rotate = .auto
@@ -236,7 +231,7 @@ func processAndSave(pages: [Data], dpi: Int, modelName: String?) throws {
 
     var images: [CroppedImage] = []
     for jpeg in pages {
-        images.append(contentsOf: try extractImages(from: jpeg, crop: opts.crop))
+        images.append(contentsOf: try extractImages(from: jpeg, splitPhotos: opts.splitPhotos))
     }
 
     // With --name or --title the files are "<base>-1.jpg", "<base>-2.jpg", …

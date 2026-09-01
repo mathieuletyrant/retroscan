@@ -102,11 +102,7 @@ struct SettingsPane: View {
                     }
                 }
                 Toggle("Grayscale", isOn: $model.grayscale)
-                Picker("Crop", selection: $model.crop) {
-                    ForEach(CropStrategy.allCases, id: \.self) { strategy in
-                        Text(strategy.rawValue.capitalized).tag(strategy)
-                    }
-                }
+                Toggle("Crop to one file per photo", isOn: $model.splitPhotos)
                 Toggle("Auto-rotate (faces upright)", isOn: $model.autoRotate)
             }
 
