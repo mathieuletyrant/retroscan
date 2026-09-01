@@ -30,6 +30,8 @@ make app         # app: assembles and installs /Applications/Retroscan.app
 
 ## 🖥️ The app
 
+![Retroscan.app: review grid with two cropped photos pending save](docs/app.png)
+
 `make app` installs **Retroscan.app**, a SwiftUI front-end to the same
 engine (both are thin layers over the `RetroscanKit` library target):
 
