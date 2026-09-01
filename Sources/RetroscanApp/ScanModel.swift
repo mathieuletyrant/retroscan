@@ -8,13 +8,15 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct PendingPhoto: Identifiable {
-    let id = UUID()
+    var id = UUID()
     let batch: UUID
     /// Small image for the grid; the full-resolution original is spilled to
-    /// `fullResURL` (lossless PNG in the session temp dir) so a long session
-    /// doesn't hold gigabytes of decoded bitmaps in memory.
+    /// `fullResURL` (lossless PNG in the pending dir) so a long session
+    /// doesn't hold gigabytes of decoded bitmaps in memory — and so an
+    /// unsaved session survives quitting the app.
     var thumbnail: CGImage
     let fullResURL: URL
+    let thumbURL: URL
     /// Manual rotation (90° clockwise steps), applied to the full-resolution
     /// image only at save time.
     var quarterTurns = 0
@@ -87,10 +89,14 @@ final class ScanModel: ObservableObject {
     private let workQueue = DispatchQueue(label: "retroscan.work", qos: .userInitiated)
     private var listener: PushScanListener?
     private var sam: SAMDetector?
-    private var lastBatch: (id: UUID, pages: [Data], dpi: Int, model: String?)?
-    /// Holds the spilled full-resolution PNGs for this session.
-    private let sessionDir = FileManager.default.temporaryDirectory
-        .appendingPathComponent("retroscan-\(UUID().uuidString)", isDirectory: true)
+    private var lastBatch: (id: UUID, pages: [Data], pageURLs: [URL], dpi: Int, model: String?)?
+    /// Holds the spilled full-resolution PNGs, thumbnails and last-scan raw
+    /// pages of the unsaved session, plus its manifest — a stable location,
+    /// so quitting the app (or crashing) loses nothing: the pending grid is
+    /// restored on the next launch.
+    private let pendingDir = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("retroscan/pending", isDirectory: true)
 
     init() {
         let d = UserDefaults.standard
@@ -110,14 +116,11 @@ final class ScanModel: ObservableObject {
         autoSave = d.bool(forKey: "autoSave")
         author = d.string(forKey: "author") ?? ""
 
-        try? FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: pendingDir, withIntermediateDirectories: true)
         loadAlbumInfo(from: outputDirectory)
+        restoreSession()
         restored = true
         refreshScanners()
-    }
-
-    deinit {
-        try? FileManager.default.removeItem(at: sessionDir)
     }
 
     // MARK: - Persistence
@@ -171,6 +174,109 @@ final class ScanModel: ObservableObject {
         keywords = info.keywords ?? ""
         dateTaken = info.dateTaken ?? ""
         if let a = info.author, !a.isEmpty { author = a }
+    }
+
+    // MARK: - Session persistence (the unsaved grid survives a relaunch)
+
+    private struct SessionManifest: Codable {
+        struct Photo: Codable {
+            var id: UUID
+            var batch: UUID
+            var fileName: String
+            var thumbName: String
+            var quarterTurns: Int
+            var dateOverride: String
+            var captionOverride: String
+            var pixelWidth: Int
+            var pixelHeight: Int
+            var method: String
+            var dpi: Int
+            var scannerModel: String?
+        }
+        struct Batch: Codable {
+            var id: UUID
+            var pageNames: [String]
+            var dpi: Int
+            var model: String?
+        }
+        var photos: [Photo]
+        var lastBatch: Batch?
+    }
+
+    private var manifestURL: URL { pendingDir.appendingPathComponent("manifest.json") }
+
+    /// Rewrites the manifest after any mutation of the pending set. The
+    /// image files themselves are already on disk (written at process
+    /// time), so this small JSON is all that a relaunch needs.
+    private func persistSession() {
+        let manifest = SessionManifest(
+            photos: photos.filter { $0.savedURL == nil }.map { photo in
+                SessionManifest.Photo(
+                    id: photo.id, batch: photo.batch,
+                    fileName: photo.fullResURL.lastPathComponent,
+                    thumbName: photo.thumbURL.lastPathComponent,
+                    quarterTurns: photo.quarterTurns,
+                    dateOverride: photo.dateOverride,
+                    captionOverride: photo.captionOverride,
+                    pixelWidth: photo.pixelWidth, pixelHeight: photo.pixelHeight,
+                    method: photo.method, dpi: photo.dpi,
+                    scannerModel: photo.scannerModel)
+            },
+            lastBatch: lastBatch.map {
+                SessionManifest.Batch(id: $0.id,
+                                      pageNames: $0.pageURLs.map(\.lastPathComponent),
+                                      dpi: $0.dpi, model: $0.model)
+            })
+        if let data = try? JSONEncoder().encode(manifest) {
+            try? data.write(to: manifestURL)
+        }
+    }
+
+    /// Rebuilds the pending grid from the manifest. The stored thumbnail is
+    /// the unrotated one; the recorded quarter turns are re-applied to it.
+    private func restoreSession() {
+        guard let data = try? Data(contentsOf: manifestURL),
+              let manifest = try? JSONDecoder().decode(SessionManifest.self, from: data) else {
+            return
+        }
+        var referenced: Set<String> = ["manifest.json"]
+        for entry in manifest.photos {
+            let fullURL = pendingDir.appendingPathComponent(entry.fileName)
+            let thumbURL = pendingDir.appendingPathComponent(entry.thumbName)
+            guard FileManager.default.fileExists(atPath: fullURL.path),
+                  var thumbnail = loadImage(thumbURL) else { continue }
+            for _ in 0..<(entry.quarterTurns % 4) {
+                thumbnail = rotated(thumbnail, .right)
+            }
+            referenced.insert(entry.fileName)
+            referenced.insert(entry.thumbName)
+            photos.append(PendingPhoto(
+                id: entry.id, batch: entry.batch, thumbnail: thumbnail,
+                fullResURL: fullURL, thumbURL: thumbURL,
+                quarterTurns: entry.quarterTurns,
+                dateOverride: entry.dateOverride,
+                captionOverride: entry.captionOverride,
+                pixelWidth: entry.pixelWidth, pixelHeight: entry.pixelHeight,
+                method: entry.method, dpi: entry.dpi,
+                scannerModel: entry.scannerModel))
+        }
+        if let batch = manifest.lastBatch {
+            let urls = batch.pageNames.map { pendingDir.appendingPathComponent($0) }
+            let pages = urls.compactMap { try? Data(contentsOf: $0) }
+            if pages.count == urls.count, !pages.isEmpty {
+                lastBatch = (batch.id, pages, urls, batch.dpi, batch.model)
+                batch.pageNames.forEach { referenced.insert($0) }
+            }
+        }
+        // Anything in the pending dir the manifest doesn't reference is a
+        // leftover (from a save interrupted mid-cleanup, say) — drop it.
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: pendingDir.path)) ?? []
+        for entry in entries where !referenced.contains(entry) {
+            try? FileManager.default.removeItem(at: pendingDir.appendingPathComponent(entry))
+        }
+        if !photos.isEmpty {
+            status = "Restored \(photos.count) unsaved photo\(photos.count > 1 ? "s" : "") from the previous session"
+        }
     }
 
     // MARK: - Discovery
@@ -312,6 +418,8 @@ final class ScanModel: ObservableObject {
     func remove(_ photo: PendingPhoto) {
         photos.removeAll { $0.id == photo.id }
         try? FileManager.default.removeItem(at: photo.fullResURL)
+        try? FileManager.default.removeItem(at: photo.thumbURL)
+        persistSession()
     }
 
     /// 90° clockwise; only offered before saving, so preview and file agree.
@@ -321,6 +429,7 @@ final class ScanModel: ObservableObject {
         photos[i].quarterTurns = (photos[i].quarterTurns + 1) % 4
         photos[i].thumbnail = rotated(photos[i].thumbnail, .right)
         (photos[i].pixelWidth, photos[i].pixelHeight) = (photos[i].pixelHeight, photos[i].pixelWidth)
+        persistSession()
     }
 
     /// Bindings into a photo's override fields for the per-photo popover.
@@ -330,6 +439,7 @@ final class ScanModel: ObservableObject {
             set: { value in
                 if let i = self.photos.firstIndex(where: { $0.id == id }) {
                     self.photos[i].dateOverride = value
+                    self.persistSession()
                 }
             })
     }
@@ -340,6 +450,7 @@ final class ScanModel: ObservableObject {
             set: { value in
                 if let i = self.photos.firstIndex(where: { $0.id == id }) {
                     self.photos[i].captionOverride = value
+                    self.persistSession()
                 }
             })
     }
@@ -347,9 +458,14 @@ final class ScanModel: ObservableObject {
     func clearAll() {
         for photo in photos {
             try? FileManager.default.removeItem(at: photo.fullResURL)
+            try? FileManager.default.removeItem(at: photo.thumbURL)
         }
         photos.removeAll()
+        if let batch = lastBatch {
+            batch.pageURLs.forEach { try? FileManager.default.removeItem(at: $0) }
+        }
         lastBatch = nil
+        persistSession()
     }
 
     /// Re-runs crop/rotate with the current settings on the last scan's raw
@@ -367,6 +483,7 @@ final class ScanModel: ObservableObject {
                     self.photos.removeAll { $0.batch == last.id && $0.savedURL == nil }
                     for photo in dropped {
                         try? FileManager.default.removeItem(at: photo.fullResURL)
+                        try? FileManager.default.removeItem(at: photo.thumbURL)
                     }
                 }
                 try self.process(pages: last.pages, dpi: last.dpi, model: last.model,
@@ -409,6 +526,7 @@ final class ScanModel: ObservableObject {
                             self.photos[i].savedURL = saved.savedURL
                         }
                     }
+                    self.persistSession()
                     self.busy = false
                     self.status = "Saved to \(settings.outDir.path)"
                 }
@@ -515,21 +633,36 @@ final class ScanModel: ObservableObject {
                 if settings.grayscale, let gray = convertToGrayscale(image) {
                     image = gray
                 }
-                let fullURL = sessionDir.appendingPathComponent("\(UUID().uuidString).png")
+                let name = UUID().uuidString
+                let fullURL = pendingDir.appendingPathComponent("\(name).png")
+                let thumbURL = pendingDir.appendingPathComponent("\(name)-thumb.png")
                 try writePNG(image, to: fullURL)
                 let thumbnail = downscaled(image, maxDim: 640) ?? image
+                try writePNG(thumbnail, to: thumbURL)
                 newPhotos.append(PendingPhoto(batch: batchID, thumbnail: thumbnail,
-                                              fullResURL: fullURL,
+                                              fullResURL: fullURL, thumbURL: thumbURL,
                                               pixelWidth: image.width, pixelHeight: image.height,
                                               method: method, dpi: dpi, scannerModel: model))
             }
+        }
+        // The raw pages are spilled too, so Re-process still works after a
+        // relaunch.
+        var pageURLs: [URL] = []
+        for (n, page) in pages.enumerated() {
+            let url = pendingDir.appendingPathComponent("\(batchID.uuidString)-p\(n).jpg")
+            try? page.write(to: url)
+            pageURLs.append(url)
         }
         if settings.autoSave {
             try save(&newPhotos, settings: settings)
         }
         DispatchQueue.main.async {
-            self.lastBatch = (batchID, pages, dpi, model)
+            if let previous = self.lastBatch {
+                previous.pageURLs.forEach { try? FileManager.default.removeItem(at: $0) }
+            }
+            self.lastBatch = (batchID, pages, pageURLs, dpi, model)
             self.photos.append(contentsOf: newPhotos)
+            self.persistSession()
         }
     }
 
@@ -571,6 +704,7 @@ final class ScanModel: ObservableObject {
             }
             toSave[i].savedURL = url
             try? FileManager.default.removeItem(at: toSave[i].fullResURL)
+            try? FileManager.default.removeItem(at: toSave[i].thumbURL)
             next += 1
         }
 

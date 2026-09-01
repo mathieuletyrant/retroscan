@@ -38,6 +38,8 @@ engine (both are thin layers over the `RetroscanKit` library target):
 - pick the scanner, resolution, crop strategy, SAM and metadata in a sidebar
 - scanned photos appear in a grid **before anything is written** — rotate or
   discard each one, then *Save* writes them all, numbered like the CLI does
+- the unsaved grid **survives quitting the app**: every scan is spilled to
+  disk as it arrives, so you can close mid-album and resume later
 - **Re-process** re-runs cropping on the last scan with the current settings
   (try another strategy or toggle SAM without rescanning)
 - **Watch** registers on the printer's *Scan to PC* menu, like `retroscan
