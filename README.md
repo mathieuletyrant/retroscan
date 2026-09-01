@@ -43,6 +43,12 @@ engine (both are thin layers over the `RetroscanKit` library target):
 - **Watch** registers on the printer's *Scan to PC* menu, like `retroscan
   watch` — with *Auto-save incoming scans* on, a whole album digitizes
   without touching the Mac
+- a photo can **override the album's date or description** (the ⓘ button)
+  for that one print you can date precisely
+- album metadata persists in a hidden `.retroscan.json` inside the output
+  folder — pick the folder again later and the album session resumes, with
+  per-file overrides recorded alongside; app-level settings (scanner,
+  resolution, author…) persist across launches
 
 ## 🎯 Usage
 

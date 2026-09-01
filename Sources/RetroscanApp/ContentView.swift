@@ -225,10 +225,11 @@ struct UnsavedBanner: View {
 struct PhotoCell: View {
     @EnvironmentObject var model: ScanModel
     let photo: PendingPhoto
+    @State private var showingInfo = false
 
     var body: some View {
         VStack(spacing: 6) {
-            Image(decorative: photo.image, scale: 1)
+            Image(decorative: photo.thumbnail, scale: 1)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(maxHeight: 240)
@@ -237,6 +238,15 @@ struct PhotoCell: View {
                 .overlay(alignment: .topTrailing) {
                     HStack(spacing: 4) {
                         if photo.savedURL == nil {
+                            Button {
+                                showingInfo = true
+                            } label: {
+                                Image(systemName: photo.hasOverrides ? "info.circle.fill" : "info.circle")
+                            }
+                            .help("Set a date or description just for this photo")
+                            .popover(isPresented: $showingInfo) {
+                                PhotoInfoPopover(photo: photo)
+                            }
                             Button {
                                 model.rotate(photo)
                             } label: {
@@ -269,7 +279,13 @@ struct PhotoCell: View {
                         .font(.system(size: 7))
                         .foregroundStyle(.orange)
                         .help("Not saved yet")
-                    Text("\(photo.image.width)×\(photo.image.height) px")
+                    Text("\(photo.pixelWidth)×\(photo.pixelHeight) px")
+                }
+                if photo.hasOverrides {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundStyle(.blue)
+                        .help([photo.dateOverride, photo.captionOverride]
+                            .filter { !$0.isEmpty }.joined(separator: " — "))
                 }
                 Text("· \(photo.method)")
                     .foregroundStyle(.secondary)
@@ -277,6 +293,39 @@ struct PhotoCell: View {
             .font(.caption)
             .lineLimit(1)
         }
+    }
+}
+
+/// Per-photo date/description overrides; an empty field inherits the album
+/// value from the sidebar.
+struct PhotoInfoPopover: View {
+    @EnvironmentObject var model: ScanModel
+    let photo: PendingPhoto
+
+    private var dateValid: Bool {
+        let text = model.dateOverride(photo.id).wrappedValue
+        return text.isEmpty || ContentDate(text) != nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("This photo only")
+                .font(.headline)
+            TextField("Date taken", text: model.dateOverride(photo.id),
+                      prompt: Text(model.dateTaken.isEmpty ? "1995-07-14" : model.dateTaken))
+            if !dateValid {
+                Text("Use 1995, 1995-07 or 1995-07-14")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            TextField("Description", text: model.captionOverride(photo.id),
+                      prompt: Text(model.caption.isEmpty ? "Description" : model.caption))
+            Text("Empty fields inherit the album values.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .frame(width: 280)
     }
 }
 

@@ -1,14 +1,29 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import ImageIO
 import Network
 import RetroscanKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct PendingPhoto: Identifiable {
     let id = UUID()
     let batch: UUID
-    var image: CGImage
+    /// Small image for the grid; the full-resolution original is spilled to
+    /// `fullResURL` (lossless PNG in the session temp dir) so a long session
+    /// doesn't hold gigabytes of decoded bitmaps in memory.
+    var thumbnail: CGImage
+    let fullResURL: URL
+    /// Manual rotation (90° clockwise steps), applied to the full-resolution
+    /// image only at save time.
+    var quarterTurns = 0
+    /// Per-photo metadata overrides; empty means "inherit the album value".
+    var dateOverride = ""
+    var captionOverride = ""
+    var hasOverrides: Bool { !dateOverride.isEmpty || !captionOverride.isEmpty }
+    var pixelWidth: Int
+    var pixelHeight: Int
     var method: String
     let dpi: Int
     let scannerModel: String?
@@ -19,6 +34,12 @@ struct PendingPhoto: Identifiable {
 /// and pipeline work runs on `workQueue` (or the watch thread); @Published
 /// state is only touched on the main thread. A scan, a save and the watch
 /// loop are mutually exclusive via `busy`/`watching`.
+///
+/// Settings persist in two places: app-level preferences (scan settings,
+/// author, last output folder) in UserDefaults, and per-album metadata
+/// (title, description, keywords, date) in a `.retroscan.json` file inside
+/// the output folder — written on save, loaded back when the folder is
+/// chosen again, so an album session resumes where it left off.
 final class ScanModel: ObservableObject {
     // Scanner
     @Published var scanners: [DiscoveredScanner] = []
@@ -26,23 +47,28 @@ final class ScanModel: ObservableObject {
     @Published var discovering = false
 
     // Scan settings
-    @Published var resolution = 300
-    @Published var grayscale = false
-    @Published var crop: CropStrategy = .auto
-    @Published var useSAM = false
-    @Published var autoRotate = true
-    @Published var quality = 0.92
+    @Published var resolution = 300 { didSet { persistDefaults() } }
+    @Published var grayscale = false { didSet { persistDefaults() } }
+    @Published var crop: CropStrategy = .auto { didSet { persistDefaults() } }
+    @Published var useSAM = false { didSet { persistDefaults() } }
+    @Published var autoRotate = true { didSet { persistDefaults() } }
+    @Published var quality = 0.92 { didSet { persistDefaults() } }
 
-    // Metadata
+    // Metadata (album-level, saved to the folder's .retroscan.json)
     @Published var title = ""
     @Published var caption = ""
-    @Published var author = ""
+    @Published var author = "" { didSet { persistDefaults() } }
     @Published var keywords = ""
     @Published var dateTaken = ""
 
     // Output
-    @Published var outputDirectory: URL
-    @Published var autoSave = false
+    @Published var outputDirectory: URL {
+        didSet {
+            persistDefaults()
+            loadAlbumInfo(from: outputDirectory)
+        }
+    }
+    @Published var autoSave = false { didSet { persistDefaults() } }
 
     // Session
     @Published var photos: [PendingPhoto] = []
@@ -54,16 +80,97 @@ final class ScanModel: ObservableObject {
     var dateTakenValid: Bool { dateTaken.isEmpty || ContentDate(dateTaken) != nil }
     var unsavedCount: Int { photos.filter { $0.savedURL == nil }.count }
 
+    /// didSet observers on wrapped properties fire even for the assignments
+    /// inside init — keep them from writing half-loaded values back to
+    /// UserDefaults until every preference has been read.
+    private var restored = false
     private let workQueue = DispatchQueue(label: "retroscan.work", qos: .userInitiated)
     private var listener: PushScanListener?
     private var sam: SAMDetector?
     private var lastBatch: (id: UUID, pages: [Data], dpi: Int, model: String?)?
+    /// Holds the spilled full-resolution PNGs for this session.
+    private let sessionDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("retroscan-\(UUID().uuidString)", isDirectory: true)
 
     init() {
-        let pictures = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        outputDirectory = pictures.appendingPathComponent("Retroscan", isDirectory: true)
+        let d = UserDefaults.standard
+        let defaultDir = (FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser)
+            .appendingPathComponent("Retroscan", isDirectory: true)
+        outputDirectory = d.string(forKey: "outputDirectory")
+            .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? defaultDir
+        if d.object(forKey: "resolution") != nil { resolution = d.integer(forKey: "resolution") }
+        grayscale = d.bool(forKey: "grayscale")
+        if let raw = d.string(forKey: "crop"), let strategy = CropStrategy(rawValue: raw) {
+            crop = strategy
+        }
+        useSAM = d.bool(forKey: "useSAM")
+        if d.object(forKey: "autoRotate") != nil { autoRotate = d.bool(forKey: "autoRotate") }
+        if d.object(forKey: "quality") != nil { quality = d.double(forKey: "quality") }
+        autoSave = d.bool(forKey: "autoSave")
+        author = d.string(forKey: "author") ?? ""
+
+        try? FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        loadAlbumInfo(from: outputDirectory)
+        restored = true
         refreshScanners()
+    }
+
+    deinit {
+        try? FileManager.default.removeItem(at: sessionDir)
+    }
+
+    // MARK: - Persistence
+
+    private func persistDefaults() {
+        guard restored else { return }
+        let d = UserDefaults.standard
+        d.set(outputDirectory.path, forKey: "outputDirectory")
+        d.set(resolution, forKey: "resolution")
+        d.set(grayscale, forKey: "grayscale")
+        d.set(crop.rawValue, forKey: "crop")
+        d.set(useSAM, forKey: "useSAM")
+        d.set(autoRotate, forKey: "autoRotate")
+        d.set(quality, forKey: "quality")
+        d.set(autoSave, forKey: "autoSave")
+        d.set(author, forKey: "author")
+    }
+
+    private struct AlbumInfo: Codable {
+        var title: String?
+        var description: String?
+        var author: String?
+        var keywords: String?
+        var dateTaken: String?
+        /// Per-file record of the overrides actually embedded at save time,
+        /// keyed by filename — a readable catalog of where a photo differs
+        /// from the album. Write-only: the JPEG's own EXIF/IPTC stays the
+        /// source of truth.
+        var files: [String: FileOverride]?
+    }
+
+    private struct FileOverride: Codable {
+        var dateTaken: String?
+        var description: String?
+    }
+
+    private static let albumFileName = ".retroscan.json"
+
+    /// Fills the metadata fields from the folder's album file; a folder
+    /// without one starts a fresh album (author, an app-level preference,
+    /// is kept).
+    private func loadAlbumInfo(from dir: URL) {
+        let url = dir.appendingPathComponent(Self.albumFileName)
+        guard let data = try? Data(contentsOf: url),
+              let info = try? JSONDecoder().decode(AlbumInfo.self, from: data) else {
+            title = ""; caption = ""; keywords = ""; dateTaken = ""
+            return
+        }
+        title = info.title ?? ""
+        caption = info.description ?? ""
+        keywords = info.keywords ?? ""
+        dateTaken = info.dateTaken ?? ""
+        if let a = info.author, !a.isEmpty { author = a }
     }
 
     // MARK: - Discovery
@@ -204,15 +311,43 @@ final class ScanModel: ObservableObject {
 
     func remove(_ photo: PendingPhoto) {
         photos.removeAll { $0.id == photo.id }
+        try? FileManager.default.removeItem(at: photo.fullResURL)
     }
 
     /// 90° clockwise; only offered before saving, so preview and file agree.
+    /// The thumbnail turns immediately, the full-resolution image at save.
     func rotate(_ photo: PendingPhoto) {
         guard let i = photos.firstIndex(where: { $0.id == photo.id }) else { return }
-        photos[i].image = rotated(photos[i].image, .right)
+        photos[i].quarterTurns = (photos[i].quarterTurns + 1) % 4
+        photos[i].thumbnail = rotated(photos[i].thumbnail, .right)
+        (photos[i].pixelWidth, photos[i].pixelHeight) = (photos[i].pixelHeight, photos[i].pixelWidth)
+    }
+
+    /// Bindings into a photo's override fields for the per-photo popover.
+    func dateOverride(_ id: UUID) -> Binding<String> {
+        Binding(
+            get: { self.photos.first(where: { $0.id == id })?.dateOverride ?? "" },
+            set: { value in
+                if let i = self.photos.firstIndex(where: { $0.id == id }) {
+                    self.photos[i].dateOverride = value
+                }
+            })
+    }
+
+    func captionOverride(_ id: UUID) -> Binding<String> {
+        Binding(
+            get: { self.photos.first(where: { $0.id == id })?.captionOverride ?? "" },
+            set: { value in
+                if let i = self.photos.firstIndex(where: { $0.id == id }) {
+                    self.photos[i].captionOverride = value
+                }
+            })
     }
 
     func clearAll() {
+        for photo in photos {
+            try? FileManager.default.removeItem(at: photo.fullResURL)
+        }
         photos.removeAll()
         lastBatch = nil
     }
@@ -228,7 +363,11 @@ final class ScanModel: ObservableObject {
             do {
                 let sam = try self.prepareSAM(settings)
                 DispatchQueue.main.async {
+                    let dropped = self.photos.filter { $0.batch == last.id && $0.savedURL == nil }
                     self.photos.removeAll { $0.batch == last.id && $0.savedURL == nil }
+                    for photo in dropped {
+                        try? FileManager.default.removeItem(at: photo.fullResURL)
+                    }
                 }
                 try self.process(pages: last.pages, dpi: last.dpi, model: last.model,
                                  sam: sam, settings: settings)
@@ -291,6 +430,7 @@ final class ScanModel: ObservableObject {
         var outDir: URL
         var autoSave: Bool
         var baseName: String
+        var album: AlbumInfo
     }
 
     private func snapshotSettings() -> Settings {
@@ -306,10 +446,17 @@ final class ScanModel: ObservableObject {
             dpi: resolution,
             jpegQuality: quality)
         let base = sanitizeForFilename(title)
+        let album = AlbumInfo(
+            title: title.isEmpty ? nil : title,
+            description: caption.isEmpty ? nil : caption,
+            author: author.isEmpty ? nil : author,
+            keywords: keywords.isEmpty ? nil : keywords,
+            dateTaken: dateTaken.isEmpty ? nil : dateTaken)
         return Settings(resolution: resolution, grayscale: grayscale, crop: crop,
                         useSAM: useSAM, autoRotate: autoRotate, metadata: metadata,
                         outDir: outputDirectory, autoSave: autoSave,
-                        baseName: base.isEmpty ? "scan" : base)
+                        baseName: base.isEmpty ? "scan" : base,
+                        album: album)
     }
 
     private func setStatus(_ text: String) {
@@ -368,8 +515,13 @@ final class ScanModel: ObservableObject {
                 if settings.grayscale, let gray = convertToGrayscale(image) {
                     image = gray
                 }
-                newPhotos.append(PendingPhoto(batch: batchID, image: image, method: method,
-                                              dpi: dpi, scannerModel: model))
+                let fullURL = sessionDir.appendingPathComponent("\(UUID().uuidString).png")
+                try writePNG(image, to: fullURL)
+                let thumbnail = downscaled(image, maxDim: 640) ?? image
+                newPhotos.append(PendingPhoto(batch: batchID, thumbnail: thumbnail,
+                                              fullResURL: fullURL,
+                                              pixelWidth: image.width, pixelHeight: image.height,
+                                              method: method, dpi: dpi, scannerModel: model))
             }
         }
         if settings.autoSave {
@@ -382,19 +534,95 @@ final class ScanModel: ObservableObject {
     }
 
     /// Writes every unsaved photo as "<base>-N.jpg", numbering continuing
-    /// from whatever already exists in the folder (same rule as the CLI).
+    /// from whatever already exists in the folder (same rule as the CLI),
+    /// then records the album metadata alongside them.
     private func save(_ toSave: inout [PendingPhoto], settings: Settings) throws {
         try FileManager.default.createDirectory(at: settings.outDir,
                                                 withIntermediateDirectories: true)
         var next = nextFreeIndex(in: settings.outDir, base: settings.baseName)
+        var recorded: [String: FileOverride] = [:]
         for i in toSave.indices where toSave[i].savedURL == nil {
+            guard var image = loadImage(toSave[i].fullResURL) else {
+                throw PipelineError.decodeFailed
+            }
+            switch toSave[i].quarterTurns {
+            case 1: image = rotated(image, .right)
+            case 2: image = rotated(image, .down)
+            case 3: image = rotated(image, .left)
+            default: break
+            }
             let url = settings.outDir.appendingPathComponent("\(settings.baseName)-\(next).jpg")
             var metadata = settings.metadata
             metadata.scannerModel = toSave[i].scannerModel
             metadata.dpi = toSave[i].dpi
-            try writeJPEG(image: toSave[i].image, metadata: metadata, to: url)
+            // Per-photo overrides win over the album values.
+            var applied = FileOverride()
+            if let date = ContentDate(toSave[i].dateOverride) {
+                metadata.contentDate = date
+                applied.dateTaken = toSave[i].dateOverride
+            }
+            if !toSave[i].captionOverride.isEmpty {
+                metadata.description = toSave[i].captionOverride
+                applied.description = toSave[i].captionOverride
+            }
+            try writeJPEG(image: image, metadata: metadata, to: url)
+            if applied.dateTaken != nil || applied.description != nil {
+                recorded[url.lastPathComponent] = applied
+            }
             toSave[i].savedURL = url
+            try? FileManager.default.removeItem(at: toSave[i].fullResURL)
             next += 1
         }
+
+        // The album file: current album values, plus the per-file override
+        // records accumulated across saves (earlier entries are kept).
+        var album = settings.album
+        let albumURL = settings.outDir.appendingPathComponent(Self.albumFileName)
+        if let data = try? Data(contentsOf: albumURL),
+           let existing = try? JSONDecoder().decode(AlbumInfo.self, from: data) {
+            album.files = existing.files
+        }
+        if !recorded.isEmpty {
+            album.files = (album.files ?? [:]).merging(recorded) { _, new in new }
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(album) {
+            try? data.write(to: albumURL)
+        }
+    }
+
+    // MARK: - Image spill helpers
+
+    private func writePNG(_ image: CGImage, to url: URL) throws {
+        guard let dest = CGImageDestinationCreateWithURL(
+                url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+            throw PipelineError.encodeFailed(url.path)
+        }
+        CGImageDestinationAddImage(dest, image, nil)
+        guard CGImageDestinationFinalize(dest) else {
+            throw PipelineError.encodeFailed(url.path)
+        }
+    }
+
+    private func loadImage(_ url: URL) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
+
+    private func downscaled(_ image: CGImage, maxDim: Int) -> CGImage? {
+        let scale = min(1.0, Double(maxDim) / Double(max(image.width, image.height)))
+        guard scale < 1.0 else { return image }
+        let w = max(1, Int(Double(image.width) * scale))
+        let h = max(1, Int(Double(image.height) * scale))
+        guard let ctx = CGContext(data: nil, width: w, height: h,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return nil
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
     }
 }
