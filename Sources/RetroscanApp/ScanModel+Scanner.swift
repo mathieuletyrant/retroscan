@@ -112,8 +112,12 @@ extension ScanModel {
                     do {
                         self.setStatus("Scan button pressed…")
                         let (pages, dpi) = try self.scan(endpoint: endpoint, settings: settings)
-                        try self.process(pages: pages, dpi: dpi, model: modelName,
-                                         settings: settings)
+                        // Hop to workQueue so file writes (JPEGs, album
+                        // JSON) never race a rewrite running there.
+                        try self.workQueue.sync {
+                            try self.process(pages: pages, dpi: dpi, model: modelName,
+                                             settings: settings)
+                        }
                         self.setStatus("Watching — ready for the next press")
                     } catch {
                         self.setStatus("\(error) — still watching")

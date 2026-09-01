@@ -41,6 +41,8 @@ extension ScanModel {
     func loadAlbumInfo(from dir: URL) {
         // The grid always mirrors the current folder.
         photos.removeAll()
+        loadingAlbum = true
+        defer { loadingAlbum = false }
         let url = dir.appendingPathComponent(Self.albumFileName)
         guard let data = try? Data(contentsOf: url),
               let info = try? JSONDecoder().decode(AlbumInfo.self, from: data) else {
@@ -53,6 +55,72 @@ extension ScanModel {
         dateTaken = info.dateTaken ?? ""
         if let a = info.author, !a.isEmpty { author = a }
         restoreAlbumPhotos(from: dir, files: info.files ?? [:])
+    }
+
+    /// Writes the current album-level fields to the folder's album file,
+    /// keeping its per-file records. Called from the metadata fields'
+    /// didSet observers — with immediate saving, nothing else would persist
+    /// an edit made after the last scan.
+    func persistAlbumInfo() {
+        guard restored, !loadingAlbum else { return }
+        let dir = outputDirectory
+        let album = snapshotSettings().album
+        workQueue.async {
+            let url = dir.appendingPathComponent(Self.albumFileName)
+            var merged = album
+            if let data = try? Data(contentsOf: url),
+               let existing = try? JSONDecoder().decode(AlbumInfo.self, from: data) {
+                merged.files = existing.files
+            }
+            try? FileManager.default.createDirectory(at: dir,
+                                                     withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            if let out = try? encoder.encode(merged) {
+                try? out.write(to: url)
+            }
+        }
+        schedulePropagation()
+    }
+
+    /// Waits for a pause in typing, then folds the new album metadata into
+    /// the photos themselves.
+    private func schedulePropagation() {
+        albumMetadataPropagation?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.propagateAlbumMetadata() }
+        albumMetadataPropagation = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+    }
+
+    /// Re-embeds the current album metadata into every photo of the grid —
+    /// editing the sidebar updates the files, not just the album JSON.
+    /// Pixels are reused as-is (per-photo ⓘ overrides still win), so the
+    /// grid doesn't change.
+    private func propagateAlbumMetadata() {
+        guard !photos.isEmpty else { return }
+        guard !busy else {  // a scan or rewrite is running: try again after it
+            schedulePropagation()
+            return
+        }
+        busy = true
+        let settings = snapshotSettings()
+        let targets = photos
+        workQueue.async {
+            var updated = 0
+            for photo in targets {
+                guard let image = loadImage(photo.savedURL) else { continue }
+                let metadata = self.metadataForSaved(photo: photo, settings: settings)
+                do {
+                    try writeJPEG(image: image, metadata: metadata, to: photo.savedURL)
+                    updated += 1
+                } catch { continue }
+                self.setStatus("Updating metadata… \(updated)/\(targets.count)")
+            }
+            DispatchQueue.main.async {
+                self.busy = false
+                self.status = "Metadata updated in \(updated) photo\(updated == 1 ? "" : "s")"
+            }
+        }
     }
 
     /// Rebuilds grid entries for the album's saved files (thumbnails decode

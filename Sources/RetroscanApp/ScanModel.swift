@@ -74,12 +74,14 @@ final class ScanModel: ObservableObject {
     @Published var autoRotate = true { didSet { persistDefaults() } }
     @Published var quality = 0.92 { didSet { persistDefaults() } }
 
-    // Metadata (album-level, saved to the folder's .retroscan.json)
-    @Published var title = ""
-    @Published var caption = ""
-    @Published var author = "" { didSet { persistDefaults() } }
-    @Published var keywords = ""
-    @Published var dateTaken = ""
+    // Metadata (album-level, written to the folder's .retroscan.json as
+    // soon as a field changes — nothing else would persist an edit made
+    // after the last scan)
+    @Published var title = "" { didSet { persistAlbumInfo() } }
+    @Published var caption = "" { didSet { persistAlbumInfo() } }
+    @Published var author = "" { didSet { persistDefaults(); persistAlbumInfo() } }
+    @Published var keywords = "" { didSet { persistAlbumInfo() } }
+    @Published var dateTaken = "" { didSet { persistAlbumInfo() } }
 
     // Output
     @Published var outputDirectory: URL {
@@ -104,7 +106,13 @@ final class ScanModel: ObservableObject {
     /// didSet observers on wrapped properties fire even for the assignments
     /// inside init — keep them from writing half-loaded values back to
     /// UserDefaults until every preference has been read.
-    private var restored = false
+    var restored = false
+    /// True while loadAlbumInfo fills the metadata fields, so their didSet
+    /// observers don't write half-loaded values back to the album file.
+    var loadingAlbum = false
+    /// Debounces re-embedding the album metadata into every photo's JPEG
+    /// after sidebar edits (main thread only).
+    var albumMetadataPropagation: DispatchWorkItem?
     let workQueue = DispatchQueue(label: "retroscan.work", qos: .userInitiated)
     var listener: PushScanListener?
     var lastBatch: (id: UUID, pages: [Data], pageURLs: [URL], dpi: Int, model: String?)?

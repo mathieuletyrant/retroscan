@@ -85,7 +85,7 @@ extension ScanModel {
 
     /// Metadata for rewriting a photo: what save() would embed today, with
     /// the photo's own overrides on top.
-    private func metadataForSaved(photo: AlbumPhoto, settings: Settings) -> ImageMetadata {
+    func metadataForSaved(photo: AlbumPhoto, settings: Settings) -> ImageMetadata {
         var metadata = settings.metadata
         metadata.scannerModel = photo.scannerModel
         metadata.dpi = photo.dpi
