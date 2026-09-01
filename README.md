@@ -1,8 +1,8 @@
 # 📸 retroscan
 
-A macOS CLI (Swift, zero dependencies, zero drivers) that scans from a
-networked Brother printer, auto-crops each photo, puts them upright, and
-embeds metadata — built for digitizing whole albums of old photo prints.
+A macOS CLI **and app** (Swift, zero dependencies, zero drivers) that scans
+from a networked Brother printer, auto-crops each photo, puts them upright,
+and embeds metadata — built for digitizing whole albums of old photo prints.
 
 Tested with a Brother MFC-1910W. Works with any Brother device exposing the
 `_scanner._tcp` Bonjour service (port 54921, the protocol behind the SANE
@@ -24,8 +24,23 @@ where none exists anymore.
 ## 🚀 Install
 
 ```sh
-make build       # swift build -c release + sudo cp to /usr/local/bin
+make build       # CLI: swift build -c release + sudo cp to /usr/local/bin
+make app         # app: assembles and installs /Applications/Retroscan.app
 ```
+
+## 🖥️ The app
+
+`make app` installs **Retroscan.app**, a SwiftUI front-end to the same
+engine (both are thin layers over the `RetroscanKit` library target):
+
+- pick the scanner, resolution, crop strategy, SAM and metadata in a sidebar
+- scanned photos appear in a grid **before anything is written** — rotate or
+  discard each one, then *Save* writes them all, numbered like the CLI does
+- **Re-process** re-runs cropping on the last scan with the current settings
+  (try another strategy or toggle SAM without rescanning)
+- **Watch** registers on the printer's *Scan to PC* menu, like `retroscan
+  watch` — with *Auto-save incoming scans* on, a whole album digitizes
+  without touching the Mac
 
 ## 🎯 Usage
 

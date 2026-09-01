@@ -1,4 +1,46 @@
 import Foundation
+import Network
+
+/// Opens a throwaway connection to learn the printer's and our own IPv4
+/// address — needed for the scan-button registration (SNMP + UDP callback).
+public func resolveAddresses(endpoint: NWEndpoint) throws -> (printer: String, local: String) {
+    let conn = NWConnection(to: endpoint, using: .tcp)
+    let sem = DispatchSemaphore(value: 0)
+    var result: (String, String)?
+    conn.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+            func ip(_ ep: NWEndpoint?) -> String? {
+                guard case let .hostPort(host, _)? = ep else { return nil }
+                let text: String
+                switch host {
+                case .ipv4(let a): text = "\(a)"
+                case .ipv6(let a): text = "\(a)"
+                case .name(let n, _): text = n
+                @unknown default: return nil
+                }
+                return text.split(separator: "%").first.map(String.init)
+            }
+            let path = conn.currentPath
+            if let printer = ip(path?.remoteEndpoint), let local = ip(path?.localEndpoint) {
+                result = (printer, local)
+            }
+            sem.signal()
+        case .failed:
+            sem.signal()
+        default:
+            break
+        }
+    }
+    conn.start(queue: .global())
+    _ = sem.wait(timeout: .now() + 10)
+    conn.cancel()
+    guard let result else {
+        throw ScanError.connectionFailed(
+            "could not determine printer/local address (try --host <ip>)")
+    }
+    return result
+}
 
 /// "Scan to PC" button support (Brother's brscan-skey protocol).
 ///
@@ -7,7 +49,7 @@ import Foundation
 /// then lists the host in its Scan > Scan to PC menu, and when the user
 /// picks it, sends a UDP datagram to the advertised host:port. Registration
 /// expires (DURATION) and is refreshed every minute.
-final class PushScanListener {
+public final class PushScanListener {
     private let printerHost: String
     private let localIP: String
     private let displayName: String
@@ -15,12 +57,14 @@ final class PushScanListener {
     private var socketFD: Int32 = -1
     private var lastTrigger = ""
     private var lastTriggerTime = Date.distantPast
+    private let stopLock = NSLock()
+    private var stopRequested = false
 
     // 54925 is not just a convention: at least the MFC-1910W sends its
     // button notifications there regardless of the port advertised in the
     // registration's HOST= field.
-    init(printerHost: String, localIP: String, displayName: String,
-         listenPort: UInt16 = 54925) {
+    public init(printerHost: String, localIP: String, displayName: String,
+                listenPort: UInt16 = 54925) {
         self.printerHost = printerHost
         self.localIP = localIP
         self.displayName = displayName
@@ -31,7 +75,7 @@ final class PushScanListener {
         if socketFD >= 0 { close(socketFD) }
     }
 
-    func start() throws {
+    public func start() throws {
         socketFD = socket(AF_INET, SOCK_DGRAM, 0)
         guard socketFD >= 0 else {
             throw ScanError.connectionFailed("cannot create UDP socket")
@@ -58,9 +102,34 @@ final class PushScanListener {
         try register()
     }
 
+    private var isStopped: Bool {
+        stopLock.lock(); defer { stopLock.unlock() }
+        return stopRequested
+    }
+
+    /// Makes a blocked `waitForButton` throw `ScanError.cancelled`: sets the
+    /// stop flag, then wakes the recv with a datagram to our own port.
+    /// Callable from any thread.
+    public func stop() {
+        stopLock.lock(); stopRequested = true; stopLock.unlock()
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = listenPort.bigEndian
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
+        var byte: UInt8 = 0
+        _ = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                sendto(fd, &byte, 1, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+    }
+
     /// Blocks until the device reports our Scan-button entry was chosen.
     /// Re-registers whenever the wait times out.
-    func waitForButton() throws {
+    public func waitForButton() throws {
         var buffer = [UInt8](repeating: 0, count: 2048)
 
         // The device retransmits each press for a while; anything that piled
@@ -68,7 +137,9 @@ final class PushScanListener {
         while recv(socketFD, &buffer, buffer.count, MSG_DONTWAIT) > 0 {}
 
         while true {
+            if isStopped { throw ScanError.cancelled }
             let n = recv(socketFD, &buffer, buffer.count, 0)
+            if isStopped { throw ScanError.cancelled }
             if n <= 0 {
                 try register()
                 continue

@@ -5,7 +5,7 @@ import ImageIO
 import Vision
 import UniformTypeIdentifiers
 
-enum CropStrategy: String {
+public enum CropStrategy: String, CaseIterable {
     case auto      // several photos -> split; one document -> perspective crop; else trim
     case document  // Vision document detection only, single output
     case photos    // always split into per-photo images
@@ -15,13 +15,13 @@ enum CropStrategy: String {
 
 /// When the photo itself was taken (for scanned prints), as opposed to when
 /// it was scanned. Missing month/day default to January 1st.
-struct ContentDate {
-    let year: Int
-    let month: Int
-    let day: Int
+public struct ContentDate {
+    public let year: Int
+    public let month: Int
+    public let day: Int
 
     /// Accepts "1995", "1995-07", "1995-07-14" (also with "/" or ":").
-    init?(_ text: String) {
+    public init?(_ text: String) {
         let parts = text.split(whereSeparator: { "-/:".contains($0) }).compactMap { Int($0) }
         guard (1...3).contains(parts.count) else { return nil }
         year = parts[0]
@@ -40,27 +40,40 @@ struct ContentDate {
     }
 }
 
-struct ImageMetadata {
-    var title: String?
-    var description: String?
-    var author: String?
-    var keywords: [String] = []
-    var contentDate: ContentDate?
-    var scannerModel: String?
-    var dpi: Int = 300
-    var jpegQuality: Double = 0.92
+public struct ImageMetadata {
+    public var title: String?
+    public var description: String?
+    public var author: String?
+    public var keywords: [String] = []
+    public var contentDate: ContentDate?
+    public var scannerModel: String?
+    public var dpi: Int = 300
+    public var jpegQuality: Double = 0.92
+
+    public init(title: String? = nil, description: String? = nil, author: String? = nil,
+                keywords: [String] = [], contentDate: ContentDate? = nil,
+                scannerModel: String? = nil, dpi: Int = 300, jpegQuality: Double = 0.92) {
+        self.title = title
+        self.description = description
+        self.author = author
+        self.keywords = keywords
+        self.contentDate = contentDate
+        self.scannerModel = scannerModel
+        self.dpi = dpi
+        self.jpegQuality = jpegQuality
+    }
 }
 
-struct CroppedImage {
-    let image: CGImage
-    let method: String  // "document", "photo", "trim" or "none"
+public struct CroppedImage {
+    public let image: CGImage
+    public let method: String  // "document", "photo", "trim" or "none"
 }
 
-enum PipelineError: Error, CustomStringConvertible {
+public enum PipelineError: Error, CustomStringConvertible {
     case decodeFailed
     case encodeFailed(String)
 
-    var description: String {
+    public var description: String {
         switch self {
         case .decodeFailed: return "could not decode scanned JPEG"
         case .encodeFailed(let path): return "could not write \(path)"
@@ -72,7 +85,7 @@ private let ciContext = CIContext()
 
 /// Applies the crop strategy to one scanned page. May return several images
 /// (e.g. multiple photos laid out on the flatbed).
-func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?) throws -> [CroppedImage] {
+public func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?) throws -> [CroppedImage] {
     guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
           let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         throw PipelineError.decodeFailed
@@ -664,7 +677,7 @@ private func trimWhiteBorders(_ image: CGImage) -> CGImage? {
 
 // MARK: - Orientation
 
-enum RotateOption {
+public enum RotateOption {
     case auto
     case none
     case fixed(CGImagePropertyOrientation)
@@ -674,7 +687,7 @@ enum RotateOption {
 /// in all four orientations and keeping the one where faces stand straight
 /// (confidence weighted by the face roll angle). Returns nil when no face
 /// gives a clear answer (e.g. landscapes).
-func detectUprightOrientation(_ image: CGImage) -> CGImagePropertyOrientation? {
+public func detectUprightOrientation(_ image: CGImage) -> CGImagePropertyOrientation? {
     var best: (orientation: CGImagePropertyOrientation, score: Double)?
     for orientation in [CGImagePropertyOrientation.up, .right, .down, .left] {
         let request = VNDetectFaceRectanglesRequest()
@@ -693,13 +706,13 @@ func detectUprightOrientation(_ image: CGImage) -> CGImagePropertyOrientation? {
     return best.orientation
 }
 
-func rotated(_ image: CGImage, _ orientation: CGImagePropertyOrientation) -> CGImage {
+public func rotated(_ image: CGImage, _ orientation: CGImagePropertyOrientation) -> CGImage {
     guard orientation != .up else { return image }
     let oriented = CIImage(cgImage: image).oriented(orientation)
     return ciContext.createCGImage(oriented, from: oriented.extent) ?? image
 }
 
-func degrees(_ orientation: CGImagePropertyOrientation) -> Int {
+public func degrees(_ orientation: CGImagePropertyOrientation) -> Int {
     switch orientation {
     case .right: return 90
     case .down: return 180
@@ -711,7 +724,7 @@ func degrees(_ orientation: CGImagePropertyOrientation) -> Int {
 // MARK: - Grayscale
 
 /// The scanner only streams JPEG in color mode; gray output is produced here.
-func convertToGrayscale(_ image: CGImage) -> CGImage? {
+public func convertToGrayscale(_ image: CGImage) -> CGImage? {
     guard let ctx = CGContext(data: nil, width: image.width, height: image.height,
                               bitsPerComponent: 8, bytesPerRow: image.width,
                               space: CGColorSpaceCreateDeviceGray(),
@@ -722,7 +735,7 @@ func convertToGrayscale(_ image: CGImage) -> CGImage? {
 
 // MARK: - Metadata + encode
 
-func writeJPEG(image: CGImage, metadata m: ImageMetadata, to url: URL) throws {
+public func writeJPEG(image: CGImage, metadata m: ImageMetadata, to url: URL) throws {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"

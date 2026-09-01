@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import RetroscanKit
 
 let usage = """
 retroscan — scan from a Brother network scanner, auto-crop, tag metadata.
@@ -160,27 +161,6 @@ func parseOptions() -> Options {
     return opts
 }
 
-// MARK: - Output naming
-
-func sanitizeForFilename(_ text: String) -> String {
-    text.map { "/:\\".contains($0) ? "-" : $0 }
-        .reduce(into: "") { $0.append($1) }
-        .trimmingCharacters(in: .whitespaces)
-}
-
-/// First index N such that no "<base>-N.jpg" (or higher) exists yet, so a new
-/// batch continues the numbering of previous runs.
-func nextFreeIndex(in dir: URL, base: String) -> Int {
-    let entries = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-    var highest = 0
-    for entry in entries {
-        guard entry.hasPrefix("\(base)-"), entry.lowercased().hasSuffix(".jpg") else { continue }
-        let middle = entry.dropFirst(base.count + 1).dropLast(4)
-        if let n = Int(middle) { highest = max(highest, n) }
-    }
-    return highest + 1
-}
-
 // MARK: - Main
 
 let opts = parseOptions()
@@ -221,46 +201,6 @@ func scanFromScanner(endpoint: NWEndpoint, modelName: String?) throws
         throw ScanError.deviceError("scanner returned no data")
     }
     return (pages, caps.resolutionX, modelName)
-}
-
-/// Opens a throwaway connection to learn the printer's and our own IPv4
-/// address — needed for the scan-button registration (SNMP + UDP callback).
-func resolveAddresses(endpoint: NWEndpoint) -> (printer: String, local: String) {
-    let conn = NWConnection(to: endpoint, using: .tcp)
-    let sem = DispatchSemaphore(value: 0)
-    var result: (String, String)?
-    conn.stateUpdateHandler = { state in
-        switch state {
-        case .ready:
-            func ip(_ ep: NWEndpoint?) -> String? {
-                guard case let .hostPort(host, _)? = ep else { return nil }
-                let text: String
-                switch host {
-                case .ipv4(let a): text = "\(a)"
-                case .ipv6(let a): text = "\(a)"
-                case .name(let n, _): text = n
-                @unknown default: return nil
-                }
-                return text.split(separator: "%").first.map(String.init)
-            }
-            let path = conn.currentPath
-            if let printer = ip(path?.remoteEndpoint), let local = ip(path?.localEndpoint) {
-                result = (printer, local)
-            }
-            sem.signal()
-        case .failed:
-            sem.signal()
-        default:
-            break
-        }
-    }
-    conn.start(queue: .global())
-    _ = sem.wait(timeout: .now() + 10)
-    conn.cancel()
-    guard let result else {
-        fail("could not determine printer/local address (try --host <ip>)")
-    }
-    return result
 }
 
 func resolveScanner() -> (NWEndpoint, String?) {
@@ -384,7 +324,12 @@ setlinebuf(stdout) // keep progress lines live when output is piped or logged
 if opts.watch {
     guard opts.input == nil else { fail("--input cannot be combined with watch") }
     let (endpoint, modelName) = resolveScanner()
-    let (printerIP, localIP) = resolveAddresses(endpoint: endpoint)
+    let printerIP: String, localIP: String
+    do {
+        (printerIP, localIP) = try resolveAddresses(endpoint: endpoint)
+    } catch {
+        fail("\(error)")
+    }
     let sam = makeSAM()
     let listener = PushScanListener(printerHost: printerIP, localIP: localIP,
                                     displayName: "retroscan")

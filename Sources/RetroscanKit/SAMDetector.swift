@@ -11,7 +11,7 @@ import CoreVideo
 /// including edges that are invisible to thresholds, like a white tablecloth
 /// against bed white. The image encoder runs once per page; the prompt
 /// encoder and mask decoder run per region (a few milliseconds each).
-final class SAMDetector {
+public final class SAMDetector {
     private let imageEncoder: MLModel
     private let promptEncoder: MLModel
     private let maskDecoder: MLModel
@@ -33,12 +33,12 @@ final class SAMDetector {
         "Data/com.apple.CoreML/weights/weight.bin",
     ]
 
-    static var modelsDirectory: URL {
+    public static var modelsDirectory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("retroscan/sam2-tiny", isDirectory: true)
     }
 
-    static func modelsPresent() -> Bool {
+    public static func modelsPresent() -> Bool {
         packages.allSatisfy { name in
             FileManager.default.fileExists(
                 atPath: modelsDirectory.appendingPathComponent("\(name).mlmodelc").path)
@@ -49,7 +49,7 @@ final class SAMDetector {
     }
 
     /// Downloads the three Core ML packages (~78 MB) from Hugging Face.
-    static func downloadModels(progress: (String) -> Void) throws {
+    public static func downloadModels(progress: (String) -> Void) throws {
         let fm = FileManager.default
         for package in packages {
             progress("downloading \(package)…")
@@ -80,7 +80,7 @@ final class SAMDetector {
         }
     }
 
-    init() throws {
+    public init() throws {
         _ = Self.outputFilter
         let config = MLModelConfiguration()
         // Matches Apple's sam2-studio demo: one encoder op is unsupported on

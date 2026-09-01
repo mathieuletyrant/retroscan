@@ -1,18 +1,20 @@
 import Foundation
 import Network
 
-enum ScanError: Error, CustomStringConvertible {
+public enum ScanError: Error, CustomStringConvertible {
     case connectionFailed(String)
     case timeout(String)
     case protocolError(String)
     case deviceError(String)
+    case cancelled
 
-    var description: String {
+    public var description: String {
         switch self {
         case .connectionFailed(let s): return "connection failed: \(s)"
         case .timeout(let s): return "timed out: \(s)"
         case .protocolError(let s): return "protocol error: \(s)"
         case .deviceError(let s): return "device error: \(s)"
+        case .cancelled: return "cancelled"
         }
     }
 }
@@ -119,17 +121,17 @@ final class SyncConnection {
 /// "CGRAY" is, counter-intuitively, the 24-bit COLOR JPEG mode on these
 /// devices (grayscale output is produced by converting locally — the
 /// hardware gray modes use a run-length encoding we don't need).
-enum ScanMode: String {
+public enum ScanMode: String {
     case color = "CGRAY"
 }
 
-struct ScannerCapabilities {
-    let resolutionX: Int
-    let resolutionY: Int
-    let widthMM: Int
-    let widthPixels: Int
-    let heightMM: Int
-    let heightPixels: Int
+public struct ScannerCapabilities {
+    public let resolutionX: Int
+    public let resolutionY: Int
+    public let widthMM: Int
+    public let widthPixels: Int
+    public let heightMM: Int
+    public let heightPixels: Int
 }
 
 /// Client for the Brother proprietary network scan protocol (TCP 54921,
@@ -142,18 +144,18 @@ struct ScannerCapabilities {
 ///      0x64 <07 00 01 00 84> <counter:4> <len:2 LE> <jpeg payload>
 ///      0x82 <07 00 01 00 84> <00 00 00 00>            end of page
 ///      0x80                                            end of session
-final class BrotherScanClient {
+public final class BrotherScanClient {
     private let endpoint: NWEndpoint
     private var conn: SyncConnection!
     private let readTimeout: TimeInterval = 120
 
-    init(endpoint: NWEndpoint) {
+    public init(endpoint: NWEndpoint) {
         self.endpoint = endpoint
     }
 
     /// Connects, retrying while the device answers "-NG" (busy: another scan
     /// app holds it, or it is still releasing the previous session).
-    func connect(attempts: Int = 5) throws {
+    public func connect(attempts: Int = 5) throws {
         for attempt in 1...attempts {
             conn = SyncConnection(endpoint: endpoint)
             try conn.connect(timeout: 10)
@@ -175,7 +177,7 @@ final class BrotherScanClient {
         }
     }
 
-    func queryCapabilities(resolution: Int, mode: ScanMode) throws -> ScannerCapabilities {
+    public func queryCapabilities(resolution: Int, mode: ScanMode) throws -> ScannerCapabilities {
         let cmd = "\u{1b}I\nR=\(resolution),\(resolution)\nM=\(mode.rawValue)\n\u{80}"
         try conn.send(Data(cmd.utf8))
         let header = try conn.read(exactly: 3, timeout: 30)
@@ -196,8 +198,8 @@ final class BrotherScanClient {
     }
 
     /// Runs the scan and returns one JPEG per page (multiple pages when the ADF is loaded).
-    func scan(capabilities caps: ScannerCapabilities, mode: ScanMode,
-              onProgress: (Int, Int) -> Void) throws -> [Data] {
+    public func scan(capabilities caps: ScannerCapabilities, mode: ScanMode,
+                     onProgress: (Int, Int) -> Void) throws -> [Data] {
         let cmd = "\u{1b}X\nR=\(caps.resolutionX),\(caps.resolutionY)\nM=\(mode.rawValue)\n"
             + "C=JPEG\nJ=MID\nB=50\nN=50\n"
             + "A=0,0,\(caps.widthPixels),\(caps.heightPixels)\nD=SIN\n\u{80}"
@@ -273,7 +275,7 @@ final class BrotherScanClient {
         }
     }
 
-    func close() {
+    public func close() {
         conn.close()
     }
 }

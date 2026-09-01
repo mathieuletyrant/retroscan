@@ -1,13 +1,13 @@
 import Foundation
 import Network
 
-struct DiscoveredScanner {
-    let name: String
-    let endpoint: NWEndpoint
+public struct DiscoveredScanner {
+    public let name: String
+    public let endpoint: NWEndpoint
 }
 
 /// Browses Bonjour for `_scanner._tcp` devices (Brother network scan protocol).
-func discoverScanners(timeout: TimeInterval = 5.0) -> [DiscoveredScanner] {
+public func discoverScanners(timeout: TimeInterval = 5.0) -> [DiscoveredScanner] {
     let browser = NWBrowser(for: .bonjour(type: "_scanner._tcp", domain: nil), using: .tcp)
     let lock = NSLock()
     var found: [String: NWEndpoint] = [:]
