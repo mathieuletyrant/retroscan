@@ -40,6 +40,10 @@ engine (both are thin layers over the `RetroscanKit` library target):
   discard each one, then *Save* writes them all, numbered like the CLI does
 - the unsaved grid **survives quitting the app**: every scan is spilled to
   disk as it arrives, so you can close mid-album and resume later
+- **adjust any crop by hand** while a photo is unsaved: the crop button
+  opens the scanned page with draggable corner handles, and Apply re-crops
+  from the full-resolution source — growable beyond the detected frame,
+  rotation kept
 - **Re-process** re-runs cropping on the last scan with the current settings
   (try another strategy or toggle SAM without rescanning)
 - **Watch** registers on the printer's *Scan to PC* menu, like `retroscan
