@@ -48,13 +48,7 @@ extension ScanModel {
         var recorded: [String: FileRecord] = [:]
         var saved: [AlbumPhoto] = []
         for item in items {
-            var image = item.image
-            switch item.quarterTurns % 4 {
-            case 1: image = rotated(image, .right)
-            case 2: image = rotated(image, .down)
-            case 3: image = rotated(image, .left)
-            default: break
-            }
+            let image = rotated(item.image, quarterTurns: item.quarterTurns)
             let url = settings.outDir.appendingPathComponent("\(settings.baseName)-\(next).jpg")
             var metadata = settings.metadata
             metadata.scannerModel = model
@@ -77,19 +71,10 @@ extension ScanModel {
 
         // The album file: current album values, plus the per-file records
         // accumulated across saves (earlier entries are kept).
-        var album = settings.album
-        let albumURL = settings.outDir.appendingPathComponent(Self.albumFileName)
-        if let data = try? Data(contentsOf: albumURL),
-           let existing = try? JSONDecoder().decode(AlbumInfo.self, from: data) {
-            album.files = existing.files
-        }
-        if !recorded.isEmpty {
-            album.files = (album.files ?? [:]).merging(recorded) { _, new in new }
-        }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(album) {
-            try? data.write(to: albumURL)
+        mutateAlbumInfo(settings.outDir.appendingPathComponent(Self.albumFileName)) { info in
+            let files = (info.files ?? [:]).merging(recorded) { _, new in new }
+            info = settings.album
+            info.files = files
         }
         return saved
     }

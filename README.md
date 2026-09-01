@@ -24,6 +24,7 @@ where none exists anymore.
 ```sh
 make build       # CLI: swift build -c release + sudo cp to /usr/local/bin
 make app         # app: assembles and installs /Applications/Retroscan.app
+make check       # self-check the crop pipeline on synthetic pages (no scanner)
 ```
 
 ## 🖥️ The app

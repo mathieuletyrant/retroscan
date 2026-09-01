@@ -262,30 +262,27 @@ func processAndSave(pages: [Data], dpi: Int, modelName: String?) throws {
     }
 
     for (cropped, url) in zip(images, urls) {
-        do {
-            var final = cropped.image
-            var rotationNote = ""
-            switch opts.rotate {
-            case .auto:
-                if let orientation = detectUprightOrientation(final), orientation != .up {
-                    final = rotated(final, orientation)
-                    rotationNote = ", rotated \(degrees(orientation))°"
-                }
-            case .fixed(let orientation):
+        var final = cropped.image
+        var rotationNote = ""
+        switch opts.rotate {
+        case .auto:
+            if let orientation = detectUprightOrientation(final), orientation != .up {
                 final = rotated(final, orientation)
                 rotationNote = ", rotated \(degrees(orientation))°"
-            case .none:
-                break
             }
-            if opts.grayscale, let gray = convertToGrayscale(final) {
-                final = gray
-            }
-            try writeJPEG(image: final, metadata: metadata, to: url)
-
-            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil
-            let sizeText = size.map { "\($0 / 1024) KB" } ?? "?"
-            print("✓ \(url.path)  \(final.width)×\(final.height) px, \(sizeText), crop: \(cropped.method)\(rotationNote)")
+        case .fixed(let orientation):
+            final = rotated(final, orientation)
+            rotationNote = ", rotated \(degrees(orientation))°"
+        case .none:
+            break
         }
+        if opts.grayscale, let gray = convertToGrayscale(final) {
+            final = gray
+        }
+        try writeJPEG(image: final, metadata: metadata, to: url)
+
+        let sizeText = fileSize(url).map { "\($0 / 1024) KB" } ?? "?"
+        print("✓ \(url.path)  \(final.width)×\(final.height) px, \(sizeText), crop: \(cropped.method)\(rotationNote)")
     }
 }
 

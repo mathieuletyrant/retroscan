@@ -1,7 +1,7 @@
 PREFIX ?= /usr/local
 APP_DEST ?= /Applications
 
-.PHONY: build app icon clean
+.PHONY: build app icon check clean
 
 build:
 	swift build -c release
@@ -27,6 +27,10 @@ app:
 icon:
 	swift Tools/make-icon.swift .build/AppIcon.iconset
 	iconutil -c icns .build/AppIcon.iconset -o Sources/RetroscanApp/AppIcon.icns
+
+# Self-check for the crop pipeline (synthetic pages, no scanner needed).
+check:
+	swift run retroscan-check
 
 clean:
 	swift package clean

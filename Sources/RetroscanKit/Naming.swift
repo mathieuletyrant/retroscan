@@ -1,9 +1,13 @@
 import Foundation
 
 public func sanitizeForFilename(_ text: String) -> String {
-    text.map { "/:\\".contains($0) ? "-" : $0 }
-        .reduce(into: "") { $0.append($1) }
+    String(text.map { "/:\\".contains($0) ? "-" : $0 })
         .trimmingCharacters(in: .whitespaces)
+}
+
+/// Size on disk, or nil if the file is unreachable.
+public func fileSize(_ url: URL) -> Int64? {
+    (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int64
 }
 
 /// First index N such that no "<base>-N.jpg" (or higher) exists yet, so a new

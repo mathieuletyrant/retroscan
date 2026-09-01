@@ -63,21 +63,13 @@ extension ScanModel {
     /// an edit made after the last scan.
     func persistAlbumInfo() {
         guard restored, !loadingAlbum else { return }
-        let dir = outputDirectory
+        let url = outputDirectory.appendingPathComponent(Self.albumFileName)
         let album = snapshotSettings().album
         workQueue.async {
-            let url = dir.appendingPathComponent(Self.albumFileName)
-            var merged = album
-            if let data = try? Data(contentsOf: url),
-               let existing = try? JSONDecoder().decode(AlbumInfo.self, from: data) {
-                merged.files = existing.files
-            }
-            try? FileManager.default.createDirectory(at: dir,
-                                                     withIntermediateDirectories: true)
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            if let out = try? encoder.encode(merged) {
-                try? out.write(to: url)
+            self.mutateAlbumInfo(url) { info in
+                let files = info.files
+                info = album
+                info.files = files
             }
         }
         schedulePropagation()
@@ -194,14 +186,18 @@ extension ScanModel {
         savedURL.deletingLastPathComponent().appendingPathComponent(Self.albumFileName)
     }
 
-    private func mutateAlbumInfo(_ albumURL: URL, _ mutate: (inout AlbumInfo) -> Void) {
-        guard let data = try? Data(contentsOf: albumURL),
-              var info = try? JSONDecoder().decode(AlbumInfo.self, from: data) else { return }
+    /// The one read-modify-write of a folder's album file (workQueue only, so
+    /// concurrent saves and record updates can't lose each other's changes).
+    /// A missing file starts from an empty album, which is how it gets created.
+    func mutateAlbumInfo(_ albumURL: URL, _ mutate: (inout AlbumInfo) -> Void) {
+        var info = (try? Data(contentsOf: albumURL))
+            .flatMap { try? JSONDecoder().decode(AlbumInfo.self, from: $0) } ?? AlbumInfo()
         mutate(&info)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let out = try? encoder.encode(info) {
-            try? out.write(to: albumURL)
-        }
+        guard let out = try? encoder.encode(info) else { return }
+        try? FileManager.default.createDirectory(at: albumURL.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        try? out.write(to: albumURL)
     }
 }

@@ -206,14 +206,14 @@ extension ScanModel {
                 // later re-crop from that page composes with it.
                 var turns = 0
                 if settings.autoRotate, let o = detectUprightOrientation(image), o != .up {
-                    turns = quarterTurns(for: o)
+                    turns = degrees(o) / 90
                     method += ", rotated \(degrees(o))°"
                 }
                 if settings.grayscale, let gray = convertToGrayscale(image) {
                     image = gray
                 }
-                var thumbnail = downscaled(image, maxDim: 640) ?? image
-                for _ in 0..<turns { thumbnail = rotated(thumbnail, .right) }
+                let thumbnail = rotated(downscaled(image, maxDim: 640) ?? image,
+                                        quarterTurns: turns)
                 items.append(ProcessedImage(image: image, thumbnail: thumbnail,
                                             quarterTurns: turns, method: method,
                                             pageIndex: pageIndex,
@@ -241,15 +241,6 @@ extension ScanModel {
                 dpi: dpi, model: model)
             self.photos.append(contentsOf: newPhotos)
             self.persistCache()
-        }
-    }
-
-    private func quarterTurns(for orientation: CGImagePropertyOrientation) -> Int {
-        switch orientation {
-        case .right: return 1
-        case .down: return 2
-        case .left: return 3
-        default: return 0
         }
     }
 }

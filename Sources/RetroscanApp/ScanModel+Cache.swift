@@ -80,9 +80,7 @@ extension ScanModel {
 
     private func updateCacheSize() {
         cacheBytes = batches.values.flatMap(\.pageNames).reduce(Int64(0)) { total, name in
-            let path = pendingDir.appendingPathComponent(name).path
-            let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int64
-            return total + (size ?? 0)
+            total + (fileSize(pendingDir.appendingPathComponent(name)) ?? 0)
         }
     }
 

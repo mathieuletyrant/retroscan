@@ -20,7 +20,7 @@ extension ScanModel {
     /// rewritten in place.
     func rotate(_ photo: AlbumPhoto) {
         guard !busy, let i = photos.firstIndex(where: { $0.id == photo.id }) else { return }
-        rewriteSavedInPlace(photo: photos[i], addTurn: true, settings: snapshotSettings())
+        rewriteSaved(photo: photos[i], addTurn: true)
     }
 
     /// Bindings into a photo's override fields for the per-photo popover.
@@ -79,8 +79,7 @@ extension ScanModel {
             CGRect(x: 0, y: 0, width: page.width, height: page.height))
         guard bounded.width >= 20, bounded.height >= 20,
               let image = page.cropping(to: bounded) else { return }
-        rewriteSavedCrop(photo: photos[i], image: image, bounded: bounded,
-                         settings: snapshotSettings())
+        rewriteSaved(photo: photos[i], crop: (image, bounded))
     }
 
     /// Metadata for rewriting a photo: what save() would embed today, with
@@ -94,64 +93,36 @@ extension ScanModel {
         return metadata
     }
 
-    /// Crop edit: apply the photo's rotation to the fresh crop, re-embed
-    /// the metadata, overwrite the JPEG, and record the new rectangle.
-    private func rewriteSavedCrop(photo: AlbumPhoto, image: CGImage, bounded: CGRect,
-                                  settings: Settings) {
+    /// Rewrites a photo's JPEG in place: a fresh crop from the source page
+    /// (crop editor), or the file's own pixels re-encoded with one more
+    /// quarter turn (rotate) or new metadata (overrides, album edits).
+    /// Reusing the saved pixels keeps a grayscale photo grayscale and costs
+    /// one re-encode generation, invisible at our quality; the album record
+    /// keeps quarterTurns relative to the source page so a later crop edit
+    /// still composes correctly.
+    private func rewriteSaved(photo: AlbumPhoto, crop: (image: CGImage, rect: CGRect)? = nil,
+                              addTurn: Bool = false) {
         busy = true
         status = "Rewriting \(photo.savedURL.lastPathComponent)…"
-        workQueue.async {
-            do {
-                var final = image
-                switch photo.quarterTurns % 4 {
-                case 1: final = rotated(final, .right)
-                case 2: final = rotated(final, .down)
-                case 3: final = rotated(final, .left)
-                default: break
-                }
-                try writeJPEG(image: final,
-                              metadata: self.metadataForSaved(photo: photo, settings: settings),
-                              to: photo.savedURL)
-                self.updateAlbumRecord(for: photo.savedURL, photo: photo, rect: bounded,
-                                       turns: photo.quarterTurns, method: "manual")
-                let thumbnail = downscaled(final, maxDim: 640) ?? final
-                DispatchQueue.main.async {
-                    if let i = self.photos.firstIndex(where: { $0.id == photo.id }) {
-                        self.photos[i].thumbnail = thumbnail
-                        self.photos[i].pixelWidth = final.width
-                        self.photos[i].pixelHeight = final.height
-                        self.photos[i].method = "manual"
-                        self.photos[i].sourceRect = bounded
-                    }
-                    self.busy = false
-                    self.status = "Rewrote \(photo.savedURL.lastPathComponent)"
-                }
-            } catch {
-                self.finish(with: error)
-            }
-        }
-    }
-
-    /// Rewrites a photo from its own JPEG pixels — used by rotate and by
-    /// metadata-override edits, so neither needs the source page (and a
-    /// grayscale photo stays grayscale). One re-encode generation, invisible
-    /// at our quality; the record keeps quarterTurns relative to the source
-    /// page so a later crop edit still composes correctly.
-    private func rewriteSavedInPlace(photo: AlbumPhoto, addTurn: Bool, settings: Settings) {
-        busy = true
-        status = "Rewriting \(photo.savedURL.lastPathComponent)…"
+        let settings = snapshotSettings()
         let turns = photo.quarterTurns + (addTurn ? 1 : 0)
         workQueue.async {
             do {
-                guard var image = loadImage(photo.savedURL) else {
-                    throw PipelineError.decodeFailed
+                let image: CGImage
+                if let crop {
+                    image = rotated(crop.image, quarterTurns: photo.quarterTurns)
+                } else {
+                    guard let saved = loadImage(photo.savedURL) else {
+                        throw PipelineError.decodeFailed
+                    }
+                    image = addTurn ? rotated(saved, .right) : saved
                 }
-                if addTurn { image = rotated(image, .right) }
                 try writeJPEG(image: image,
                               metadata: self.metadataForSaved(photo: photo, settings: settings),
                               to: photo.savedURL)
-                self.updateAlbumRecord(for: photo.savedURL, photo: photo, rect: photo.sourceRect,
-                                       turns: turns, method: photo.method)
+                self.updateAlbumRecord(for: photo.savedURL, photo: photo,
+                                       rect: crop?.rect ?? photo.sourceRect, turns: turns,
+                                       method: crop == nil ? photo.method : "manual")
                 let thumbnail = downscaled(image, maxDim: 640) ?? image
                 DispatchQueue.main.async {
                     if let i = self.photos.firstIndex(where: { $0.id == photo.id }) {
@@ -159,6 +130,10 @@ extension ScanModel {
                         self.photos[i].pixelWidth = image.width
                         self.photos[i].pixelHeight = image.height
                         self.photos[i].quarterTurns = turns
+                        if let crop {
+                            self.photos[i].method = "manual"
+                            self.photos[i].sourceRect = crop.rect
+                        }
                     }
                     self.busy = false
                     self.status = "Rewrote \(photo.savedURL.lastPathComponent)"
@@ -173,7 +148,7 @@ extension ScanModel {
     /// re-embeds the metadata into the JPEG right away.
     func commitOverrides(_ id: UUID) {
         guard !busy, let i = photos.firstIndex(where: { $0.id == id }) else { return }
-        rewriteSavedInPlace(photo: photos[i], addTurn: false, settings: snapshotSettings())
+        rewriteSaved(photo: photos[i])
     }
 
     /// Empties the grid. Files on disk and cached pages are untouched —

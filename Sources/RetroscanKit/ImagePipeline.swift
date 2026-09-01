@@ -185,24 +185,20 @@ private struct Mask {
 /// separately: the background only has to show on one of them.
 private func backgroundLevel(_ pixels: UnsafeMutablePointer<UInt8>, _ sw: Int, _ sh: Int) -> Int {
     let border = max(1, min(sw, sh) / 50)
-    var sides: [[UInt8]] = [[], [], [], []]
-    for y in 0..<sh {
-        for x in 0..<sw {
-            let v = pixels[y * sw + x]
-            if y < border { sides[0].append(v) }
-            if y >= sh - border { sides[1].append(v) }
-            if x < border { sides[2].append(v) }
-            if x >= sw - border { sides[3].append(v) }
-        }
-    }
     var medians: [Int] = []
     var spreads: [Int] = []
-    for i in sides.indices {
-        sides[i].sort()
-        let side = sides[i]
-        guard !side.isEmpty else { continue }
-        medians.append(Int(side[side.count / 2]))
-        spreads.append(Int(side[side.count * 3 / 4]) - Int(side[side.count / 4]))
+    for side in 0..<4 {
+        let ys = side == 0 ? 0..<border : side == 1 ? (sh - border)..<sh : 0..<sh
+        let xs = side == 2 ? 0..<border : side == 3 ? (sw - border)..<sw : 0..<sw
+        var values: [UInt8] = []
+        values.reserveCapacity(ys.count * xs.count)
+        for y in ys {
+            for x in xs { values.append(pixels[y * sw + x]) }
+        }
+        guard !values.isEmpty else { continue }
+        values.sort()
+        medians.append(Int(values[values.count / 2]))
+        spreads.append(Int(values[values.count * 3 / 4]) - Int(values[values.count / 4]))
     }
     guard let brightest = medians.max() else { return 255 }
     // Any side that reads near-white is bare bed.
@@ -298,17 +294,17 @@ private func detectContentRegions(_ image: CGImage) -> (regions: [CGRect], backg
     let mask = dilate(rawMask, radius: 2)
     let w = mask.width, h = mask.height
 
-    var labels = [Int](repeating: 0, count: w * h)
+    var seen = [Bool](repeating: false, count: w * h)
     var boxes: [(minX: Int, minY: Int, maxX: Int, maxY: Int, area: Int)] = []
-    var next = 1
     var stack: [Int] = []
+    let neighbours = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
-    for start in 0..<(w * h) where mask.bits[start] && labels[start] == 0 {
+    for start in 0..<(w * h) where mask.bits[start] && !seen[start] {
         var minX = Int.max, maxX = Int.min
         var minY = Int.max, maxY = Int.min
         var area = 0
         stack.append(start)
-        labels[start] = next
+        seen[start] = true
         while let idx = stack.popLast() {
             let x = idx % w, y = idx / w
             // The flood fill walks the dilated mask so one photo stays one
@@ -319,12 +315,12 @@ private func detectContentRegions(_ image: CGImage) -> (regions: [CGRect], backg
                 minX = min(minX, x); maxX = max(maxX, x)
                 minY = min(minY, y); maxY = max(maxY, y)
             }
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            for (dx, dy) in neighbours {
                 let nx = x + dx, ny = y + dy
                 guard nx >= 0, nx < w, ny >= 0, ny < h else { continue }
                 let nidx = ny * w + nx
-                if mask.bits[nidx] && labels[nidx] == 0 {
-                    labels[nidx] = next
+                if mask.bits[nidx] && !seen[nidx] {
+                    seen[nidx] = true
                     stack.append(nidx)
                 }
             }
@@ -332,7 +328,6 @@ private func detectContentRegions(_ image: CGImage) -> (regions: [CGRect], backg
         if area > 0 {
             boxes.append((minX, minY, maxX, maxY, area))
         }
-        next += 1
     }
 
     // A real photo/document fills a meaningful part of the bed and is
@@ -396,9 +391,9 @@ private func splitMergedPhotos(_ image: CGImage, _ rect: CGRect, background: Int
     let sh = max(1, Int(Double(region.height) * scale))
     guard let ctx = CGContext(data: nil, width: sw, height: sh, bitsPerComponent: 8,
                               bytesPerRow: sw, space: CGColorSpaceCreateDeviceGray(),
-                              bitmapInfo: CGImageAlphaInfo.none.rawValue),
-          case _ = ctx.draw(region, in: CGRect(x: 0, y: 0, width: sw, height: sh)),
-          let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return [rect] }
+                              bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return [rect] }
+    ctx.draw(region, in: CGRect(x: 0, y: 0, width: sw, height: sh))
+    guard let pixels = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return [rect] }
 
     // Fraction of background-level pixels per column/row. Pure white always
     // counts as seam material: even over a dark backing, a strip of bare bed
@@ -691,6 +686,16 @@ public func rotated(_ image: CGImage, _ orientation: CGImagePropertyOrientation)
     guard orientation != .up else { return image }
     let oriented = CIImage(cgImage: image).oriented(orientation)
     return ciContext.createCGImage(oriented, from: oriented.extent) ?? image
+}
+
+/// `turns` 90° clockwise steps — how rotation is recorded per photo.
+public func rotated(_ image: CGImage, quarterTurns turns: Int) -> CGImage {
+    switch ((turns % 4) + 4) % 4 {
+    case 1: return rotated(image, .right)
+    case 2: return rotated(image, .down)
+    case 3: return rotated(image, .left)
+    default: return image
+    }
 }
 
 public func degrees(_ orientation: CGImagePropertyOrientation) -> Int {

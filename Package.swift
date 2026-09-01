@@ -18,5 +18,11 @@ let package = Package(
             dependencies: ["RetroscanKit"],
             path: "Sources/RetroscanApp",
             exclude: ["Info.plist", "AppIcon.icns"]),
+        // Self-check for the crop pipeline ("make check"); no test
+        // framework, because XCTest needs a full Xcode install.
+        .executableTarget(
+            name: "retroscan-check",
+            dependencies: ["RetroscanKit"],
+            path: "Sources/RetroscanCheck"),
     ]
 )
