@@ -1,0 +1,66 @@
+name: Release
+
+# Run it by hand (Actions > Release > Run workflow, or `gh workflow run
+# release.yml`) to replace the rolling "latest" release with a fresh build of
+# whatever main points at. Only uses tooling already on the runner — no
+# third-party actions.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Two runs at once would race to replace the same release.
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-check the crop pipeline
+        run: make check
+
+      - name: Build the universal app bundle
+        run: |
+          make universal
+          make bundle BIN=.build/universal/RetroscanApp
+          lipo -info "$BUNDLE/Contents/MacOS/Retroscan"
+        env:
+          BUNDLE: .build/release/Retroscan.app
+
+      # Stamped before signing: editing Info.plist afterwards would break the
+      # signature, so the bundle is re-signed here.
+      - name: Stamp the build number
+        run: |
+          plist=.build/release/Retroscan.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "$plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.0-${GITHUB_SHA:0:7}" "$plist"
+          codesign --force --sign - .build/release/Retroscan.app
+          codesign --verify --verbose .build/release/Retroscan.app
+
+      # ditto, not zip: it preserves the bundle's symlinks and its signature.
+      - name: Zip the bundle
+        run: ditto -c -k --keepParent .build/release/Retroscan.app Retroscan.zip
+
+      - name: Publish to the rolling "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest Retroscan.zip \
+            --target "$GITHUB_SHA" \
+            --title "Latest build" \
+            --prerelease \
+            --notes "Build ${{ github.run_number }} of \`${GITHUB_SHA:0:7}\`, universal (Apple Silicon + Intel), macOS 13 or later.
+
+          **This build is signed ad-hoc, not with an Apple Developer ID**, so macOS refuses to open it after a download. Unpack it into /Applications, then once:
+
+          \`\`\`sh
+          xattr -dr com.apple.quarantine /Applications/Retroscan.app
+          \`\`\`
+
+          Building it yourself with \`make app\` avoids that entirely."

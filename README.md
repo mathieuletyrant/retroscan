@@ -32,6 +32,17 @@ make app         # app: assembles and installs /Applications/Retroscan.app
 make check       # self-check the crop pipeline on synthetic pages (no scanner)
 ```
 
+Or download the [latest build](https://github.com/mathieuletyrant/retroscan/releases/tag/latest)
+— universal (Apple Silicon and Intel), published by hand from `main`. It is
+signed ad-hoc rather than with an Apple Developer ID, so macOS will refuse to
+open it: unpack it into `/Applications`, then once
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Retroscan.app
+```
+
+Building it yourself with `make app` avoids that step.
+
 ## 🖥️ The app
 
 ![Retroscan.app: the settings sidebar and the album grid](docs/app.png)
