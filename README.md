@@ -18,8 +18,6 @@ where none exists anymore.
 - 🏷️ **Metadata** — original shooting date, title, keywords, author, scanner
   model, DPI, all embedded in EXIF/IPTC/TIFF
 - 🔘 **Watch mode** — press the printer's Scan button, the Mac does the rest
-- 🧠 **Optional Segment Anything** — SAM 2 on the Neural Engine for photos
-  whose edges are nearly white
 
 ## 🚀 Install
 
@@ -30,31 +28,34 @@ make app         # app: assembles and installs /Applications/Retroscan.app
 
 ## 🖥️ The app
 
-![Retroscan.app: review grid with two cropped photos pending save](docs/app.png)
+![Retroscan.app: the album grid with two cropped photos](docs/app.png)
 
 `make app` installs **Retroscan.app**, a SwiftUI front-end to the same
 engine (both are thin layers over the `RetroscanKit` library target):
 
-- pick the scanner, resolution, crop strategy, SAM and metadata in a sidebar
-- scanned photos appear in a grid **before anything is written** — rotate or
-  discard each one, then *Save* writes them all, numbered like the CLI does
-- the unsaved grid **survives quitting the app**: every scan is spilled to
-  disk as it arrives, so you can close mid-album and resume later
-- **adjust any crop by hand** while a photo is unsaved: the crop button
-  opens the scanned page with draggable corner handles, and Apply re-crops
-  from the full-resolution source — growable beyond the detected frame,
-  rotation kept
+- pick the scanner, resolution, crop strategy and album metadata in a sidebar
+- every scan is **saved to the album immediately**, numbered like the CLI
+  does — the grid shows the album, nothing is ever lost with the app closed
+- and **every photo stays editable**: adjust the crop by hand (the crop
+  button opens the scanned page with draggable corner handles, Apply
+  re-crops from the full-resolution source — growable beyond the detected
+  frame), rotate, or change the per-photo date/description (the ⓘ button);
+  the JPEG is rewritten in place. The trash button moves a reject to the
+  macOS Trash
 - **Re-process** re-runs cropping on the last scan with the current settings
-  (try another strategy or toggle SAM without rescanning)
+  (try another strategy without rescanning) — the batch's files are replaced,
+  the old ones go to the Trash
 - **Watch** registers on the printer's *Scan to PC* menu, like `retroscan
-  watch` — with *Auto-save incoming scans* on, a whole album digitizes
-  without touching the Mac
-- a photo can **override the album's date or description** (the ⓘ button)
-  for that one print you can date precisely
-- album metadata persists in a hidden `.retroscan.json` inside the output
-  folder — pick the folder again later and the album session resumes, with
-  per-file overrides recorded alongside; app-level settings (scanner,
-  resolution, author…) persist across launches
+  watch` — a whole album digitizes without touching the Mac
+- every output folder is a **reopenable project**: a hidden `.retroscan.json`
+  records the album metadata plus, per saved file, the overrides and a
+  pointer to its original scan — pick the folder again later and the saved
+  photos come back in the grid, crops still adjustable; app-level settings
+  (scanner, resolution, author…) persist across launches
+- the **original scanned pages are kept** in an app-managed cache so crops
+  stay editable forever; the sidebar shows the disk space and *Delete
+  Original Scans* reclaims it when an album is truly done (*Clear Grid*
+  never touches it)
 
 ## 🎯 Usage
 
@@ -121,24 +122,6 @@ TIFF ImageDescription + IPTC Caption), and `--date` — when the photo was
 DateTimeOriginal + IPTC DateCreated: the field Apple Photos, Google Photos
 and Lightroom sort by.
 
-## 🧠 Segment Anything (SAM 2) on Apple silicon
-
-```sh
-retroscan --sam        # downloads Apple's Core ML models (~78 MB, once)
-```
-
-With `--sam`, photo detection is powered by **Segment Anything 2** (Apple's
-official Core ML conversion, running on the GPU/Neural Engine). The
-classical detection roughly locates each print, then SAM traces its true
-outline — including edges invisible to any threshold, like a washed-out sky
-or a white tablecloth against the bed white. Models are cached in
-`~/Library/Application Support/retroscan/`.
-
-It's a rescue mode, not the default: SAM's 256×256 mask quantizes edges to
-~7 px on an A4 page at 300 dpi, so the classical luminance+gradient
-detection usually crops tighter. Reach for `--sam` when a pale-edged photo
-gets miscropped — or use the dark sheet trick below.
-
 ## 🖤 Tip: photos with near-white edges
 
 A print whose edge is itself nearly white (washed-out sky, white
@@ -172,5 +155,3 @@ touching the scanner.
 
 - Protocol details cross-checked against the in-progress
   [`brother_mfp` SANE backend](https://gitlab.com/sane-project/backends/-/merge_requests/751).
-- SAM 2 Core ML models by [Apple on Hugging Face](https://huggingface.co/apple/coreml-sam2-tiny)
-  (Apache-2.0), integration informed by [sam2-studio](https://github.com/huggingface/sam2-studio).

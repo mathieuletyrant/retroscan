@@ -89,7 +89,7 @@ private let ciContext = CIContext()
 
 /// Applies the crop strategy to one scanned page. May return several images
 /// (e.g. multiple photos laid out on the flatbed).
-public func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?) throws -> [CroppedImage] {
+public func extractImages(from jpeg: Data, crop: CropStrategy) throws -> [CroppedImage] {
     guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
           let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         throw PipelineError.decodeFailed
@@ -110,8 +110,7 @@ public func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?
     case .photos:
         let (regions, background) = detectContentRegions(image)
         if !regions.isEmpty {
-            let sam = encodedSAM(sam, image)
-            return regions.compactMap { cropRegion(image, $0, background: background, sam: sam) }
+            return regions.compactMap { cropRegion(image, $0, background: background) }
         }
         return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
 
@@ -124,8 +123,7 @@ public func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?
     case .auto:
         let (regions, background) = detectContentRegions(image)
         if regions.count >= 2 {
-            let sam = encodedSAM(sam, image)
-            return regions.compactMap { cropRegion(image, $0, background: background, sam: sam) }
+            return regions.compactMap { cropRegion(image, $0, background: background) }
         }
         // A lone region that isn't the whole page is a single photo: give it
         // the same treatment as one photo among several. (A region covering
@@ -133,8 +131,7 @@ public func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?
         // and trim fallbacks.)
         if let region = regions.first,
            Double(region.width * region.height) < Double(image.width * image.height) * 0.9,
-           let cropped = cropRegion(image, region, background: background,
-                                    sam: encodedSAM(sam, image)) {
+           let cropped = cropRegion(image, region, background: background) {
             return [cropped]
         }
         if let doc = detectAndCropDocument(image) {
@@ -144,19 +141,6 @@ public func extractImages(from jpeg: Data, crop: CropStrategy, sam: SAMDetector?
             return [CroppedImage(image: trimmed, method: "trim", sourceRect: rect)]
         }
         return [CroppedImage(image: image, method: "none", sourceRect: pageRect)]
-    }
-}
-
-/// Runs the SAM image encoder for this page, once; nil when SAM is off or
-/// the encoding fails (the classical pipeline takes over).
-private func encodedSAM(_ sam: SAMDetector?, _ image: CGImage) -> SAMDetector? {
-    guard let sam else { return nil }
-    do {
-        try sam.encode(page: image)
-        return sam
-    } catch {
-        FileHandle.standardError.write(Data("warning: SAM encoding failed (\(error)), falling back\n".utf8))
-        return nil
     }
 }
 
@@ -543,20 +527,7 @@ private func snapToRectangle(_ image: CGImage, around region: CGRect) -> CGImage
 
 /// One photo region -> cropped image: edge-based rectangle snap when Vision
 /// finds one, luminance-based tightening otherwise.
-private func cropRegion(_ image: CGImage, _ region: CGRect, background: Int,
-                        sam: SAMDetector?) -> CroppedImage? {
-    // SAM pins the print's true extent (even edges invisible to thresholds);
-    // the tighten pass then shaves the print's own white paper border. A
-    // region covering nearly the whole page is an already-cropped image:
-    // there is no background to separate and SAM would segment inside it.
-    let pageArea = Double(image.width * image.height)
-    let regionIsWholePage = Double(region.width * region.height) > pageArea * 0.9
-    if let sam, !regionIsWholePage, let refined = try? sam.refine(region: region) {
-        let rect = tightenRect(image, refined, background: background)
-        if let cropped = image.cropping(to: rect) {
-            return CroppedImage(image: cropped, method: "photo (SAM)", sourceRect: rect)
-        }
-    }
+private func cropRegion(_ image: CGImage, _ region: CGRect, background: Int) -> CroppedImage? {
     if let snapped = snapToRectangle(image, around: region) {
         // Perspective-corrected: the coarse region is only a seed for re-crops.
         return CroppedImage(image: snapped, method: "photo (edges)", sourceRect: region)

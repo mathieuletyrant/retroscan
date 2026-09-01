@@ -3,7 +3,6 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var model: ScanModel
-    @State private var confirmingClear = false
 
     var body: some View {
         NavigationSplitView {
@@ -46,35 +45,13 @@ struct ContentView: View {
                 .help("Re-run cropping on the last scan with the current settings — no rescan")
 
                 Button {
-                    if model.unsavedCount > 0 {
-                        confirmingClear = true
-                    } else {
-                        model.clearAll()
-                    }
+                    model.clearAll()
                 } label: {
-                    Label("Clear", systemImage: "xmark.bin")
+                    Label("Clear Grid", systemImage: "xmark.bin")
                         .labelStyle(.titleAndIcon)
                 }
                 .disabled(model.photos.isEmpty || model.busy)
-                .help("Empty the grid and the pending buffer (saved files are kept)")
-                .confirmationDialog(
-                    "Discard \(model.unsavedCount) unsaved photo\(model.unsavedCount > 1 ? "s" : "")?",
-                    isPresented: $confirmingClear) {
-                    Button("Discard", role: .destructive) { model.clearAll() }
-                } message: {
-                    Text("They were never written to disk and cannot be recovered.")
-                }
-
-                Button {
-                    model.saveAll()
-                } label: {
-                    Label(model.unsavedCount > 0 ? "Save \(model.unsavedCount)" : "Save",
-                          systemImage: "square.and.arrow.down")
-                        .labelStyle(.titleAndIcon)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(model.busy || model.unsavedCount == 0)
-                .help("Write every unsaved photo to the output folder")
+                .help("Remove every photo from the grid — files on disk and original scans are kept; open the album to bring them back")
             }
         }
         .alert("retroscan", isPresented: Binding(
@@ -92,6 +69,7 @@ struct ContentView: View {
 
 struct SettingsPane: View {
     @EnvironmentObject var model: ScanModel
+    @State private var confirmingCleanCache = false
 
     var body: some View {
         Form {
@@ -129,12 +107,25 @@ struct SettingsPane: View {
                         Text(strategy.rawValue.capitalized).tag(strategy)
                     }
                 }
-                Toggle("Segment Anything (SAM)", isOn: $model.useSAM)
-                    .help("Neural-network photo detection — helps when a photo edge is nearly white; downloads ~78 MB of models on first use")
                 Toggle("Auto-rotate (faces upright)", isOn: $model.autoRotate)
             }
 
-            Section("Metadata") {
+            Section {
+                LabeledContent("Folder") {
+                    Text(model.outputDirectory.lastPathComponent)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                        .help(model.outputDirectory.path)
+                }
+                HStack {
+                    Button("Open Album…") { model.chooseOutputDirectory() }
+                        .help("Choose the album's folder — an existing album reloads its photos and metadata")
+                    Button {
+                        model.revealOutputFolder()
+                    } label: {
+                        Label("Show in Finder", systemImage: "folder")
+                    }
+                }
                 TextField("Title", text: $model.title, prompt: Text("Holidays 1995"))
                 TextField("Description", text: $model.caption)
                 TextField("Author", text: $model.author)
@@ -145,31 +136,37 @@ struct SettingsPane: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
+            } header: {
+                Text("Album")
+            } footer: {
+                Text("An album is a folder of saved photos. Open it again anytime: its photos come back, still croppable and editable.")
+                    .foregroundStyle(.secondary)
             }
 
-            Section("Output") {
-                LabeledContent("Folder") {
-                    Text(model.outputDirectory.path)
-                        .lineLimit(1)
-                        .truncationMode(.head)
-                        .help(model.outputDirectory.path)
+            Section("Saving") {
+                LabeledContent("JPEG quality") {
+                    Text("\(Int((model.quality * 100).rounded())) %")
+                        .foregroundStyle(.secondary)
                 }
-                HStack {
-                    Button("Choose…") { model.chooseOutputDirectory() }
-                    Button {
-                        model.revealOutputFolder()
-                    } label: {
-                        Label("Open in Finder", systemImage: "folder")
-                    }
-                }
-                Toggle("Auto-save incoming scans", isOn: $model.autoSave)
-                    .help("Write files as soon as a scan is processed — for hands-off watch sessions")
                 Slider(value: $model.quality, in: 0.5...1.0) {
                     Text("JPEG quality")
                 }
-                Text("JPEG quality: \(model.quality, specifier: "%.2f")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .labelsHidden()
+            }
+
+            Section("Original Scans") {
+                LabeledContent("Disk space", value: model.cacheSizeText)
+                    .help("Every scanned page is kept so photo crops stay adjustable — even after saving")
+                Button("Delete Original Scans…") {
+                    confirmingCleanCache = true
+                }
+                .disabled(model.cacheBytes == 0 || model.busy)
+                .confirmationDialog("Delete all original scans (\(model.cacheSizeText))?",
+                                    isPresented: $confirmingCleanCache) {
+                    Button("Delete", role: .destructive) { model.deleteOriginalScans() }
+                } message: {
+                    Text("Photos keep their current crop and saved files stay on disk, but crops can no longer be re-adjusted.")
+                }
             }
         }
         .formStyle(.grouped)
@@ -190,7 +187,7 @@ struct PhotoGrid: View {
                         .foregroundStyle(.tertiary)
                     Text("No photos yet")
                         .font(.title3)
-                    Text("Lay prints on the glass and press Scan —\nor start Watch and use the printer's button.\nDrop a scan JPEG here to replay its cropping.")
+                    Text("Lay prints on the glass and press Scan —\nor start Watch and use the printer's button.\nEvery photo lands in the album automatically.\nDrop a scan JPEG here to replay its cropping.")
                         .multilineTextAlignment(.center)
                         .foregroundStyle(.secondary)
                 }
@@ -204,11 +201,6 @@ struct PhotoGrid: View {
                         }
                     }
                     .padding(16)
-                }
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    if model.unsavedCount > 0 {
-                        UnsavedBanner()
-                    }
                 }
             }
         }
@@ -224,37 +216,17 @@ struct PhotoGrid: View {
     }
 }
 
-/// The review-then-save flow made explicit: nothing is on disk until Save.
-struct UnsavedBanner: View {
-    @EnvironmentObject var model: ScanModel
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.circle.fill")
-                .foregroundStyle(.orange)
-            Text("\(model.unsavedCount) photo\(model.unsavedCount > 1 ? "s" : "") not on disk yet — review, then save.")
-            Spacer()
-            Button {
-                model.saveAll()
-            } label: {
-                Label("Save to “\(model.outputDirectory.lastPathComponent)”",
-                      systemImage: "square.and.arrow.down")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(model.busy)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
-    }
-}
-
 struct PhotoCell: View {
     @EnvironmentObject var model: ScanModel
-    let photo: PendingPhoto
+    let photo: AlbumPhoto
     @State private var showingInfo = false
+    @State private var overridesAtOpen: [String]?
     @State private var cropContext: CropEditingContext?
+
+    private var currentOverrides: [String] {
+        [model.dateOverride(photo.id).wrappedValue,
+         model.captionOverride(photo.id).wrappedValue]
+    }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -280,31 +252,40 @@ struct PhotoCell: View {
                                 }
                             }
                         }
-                        if photo.savedURL == nil {
-                            Button {
-                                showingInfo = true
-                            } label: {
-                                Image(systemName: photo.hasOverrides ? "info.circle.fill" : "info.circle")
+                        Button {
+                            showingInfo = true
+                        } label: {
+                            Image(systemName: photo.hasOverrides ? "info.circle.fill" : "info.circle")
+                        }
+                        .help("Set a date or description just for this photo")
+                        .popover(isPresented: $showingInfo) {
+                            PhotoInfoPopover(photo: photo)
+                        }
+                        // A saved photo's overrides are re-embedded into the
+                        // JPEG when the popover closes with changed values.
+                        .onChange(of: showingInfo) { shown in
+                            if shown {
+                                overridesAtOpen = currentOverrides
+                            } else {
+                                if overridesAtOpen != currentOverrides {
+                                    model.commitOverrides(photo.id)
+                                }
+                                overridesAtOpen = nil
                             }
-                            .help("Set a date or description just for this photo")
-                            .popover(isPresented: $showingInfo) {
-                                PhotoInfoPopover(photo: photo)
-                            }
-                            Button {
-                                model.rotate(photo)
-                            } label: {
-                                Image(systemName: "rotate.right")
-                            }
-                            .help("Rotate 90° clockwise")
                         }
                         Button {
-                            model.remove(photo)
+                            model.rotate(photo)
+                        } label: {
+                            Image(systemName: "rotate.right")
+                        }
+                        .help("Rotate 90° clockwise")
+                        .disabled(model.busy)
+                        Button {
+                            model.delete(photo)
                         } label: {
                             Image(systemName: "trash")
                         }
-                        .help(photo.savedURL == nil
-                              ? "Discard this photo"
-                              : "Remove from the list (the saved file is kept)")
+                        .help("Move this photo's file to the Trash")
                     }
                     .buttonStyle(.borderless)
                     .padding(5)
@@ -313,17 +294,8 @@ struct PhotoCell: View {
                 }
 
             HStack(spacing: 4) {
-                if let url = photo.savedURL {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                    Text(url.lastPathComponent)
-                } else {
-                    Image(systemName: "circle.fill")
-                        .font(.system(size: 7))
-                        .foregroundStyle(.orange)
-                        .help("Not saved yet")
-                    Text("\(photo.pixelWidth)×\(photo.pixelHeight) px")
-                }
+                Text(photo.savedURL.lastPathComponent)
+                    .help("\(photo.pixelWidth)×\(photo.pixelHeight) px")
                 if photo.hasOverrides {
                     Image(systemName: "info.circle.fill")
                         .foregroundStyle(.blue)
@@ -343,7 +315,7 @@ struct PhotoCell: View {
 /// value from the sidebar.
 struct PhotoInfoPopover: View {
     @EnvironmentObject var model: ScanModel
-    let photo: PendingPhoto
+    let photo: AlbumPhoto
 
     private var dateValid: Bool {
         let text = model.dateOverride(photo.id).wrappedValue
@@ -543,7 +515,7 @@ struct StatusBar: View {
                 .lineLimit(1)
             Spacer()
             if !model.photos.isEmpty {
-                Text("\(model.photos.count) photo\(model.photos.count > 1 ? "s" : ""), \(model.unsavedCount) unsaved")
+                Text("\(model.photos.count) photo\(model.photos.count > 1 ? "s" : "")")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

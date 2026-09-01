@@ -1,24 +1,18 @@
-import AppKit
 import CoreGraphics
 import Foundation
-import ImageIO
-import Network
 import RetroscanKit
 import SwiftUI
-import UniformTypeIdentifiers
 
-struct PendingPhoto: Identifiable {
+/// One photo of the album, as shown in the grid. Every photo is on disk —
+/// scans are saved the moment they are processed — and stays editable:
+/// crop, rotation and metadata edits rewrite the JPEG in place.
+struct AlbumPhoto: Identifiable {
     var id = UUID()
     let batch: UUID
-    /// Small image for the grid; the full-resolution original is spilled to
-    /// `fullResURL` (lossless PNG in the pending dir) so a long session
-    /// doesn't hold gigabytes of decoded bitmaps in memory — and so an
-    /// unsaved session survives quitting the app.
+    /// Small image for the grid; the saved JPEG is the full-resolution one.
     var thumbnail: CGImage
-    let fullResURL: URL
-    let thumbURL: URL
-    /// Manual rotation (90° clockwise steps), applied to the full-resolution
-    /// image only at save time.
+    /// Rotation (90° clockwise steps) baked into the saved JPEG, kept
+    /// relative to the source page so a later re-crop composes with it.
     var quarterTurns = 0
     /// Per-photo metadata overrides; empty means "inherit the album value".
     var dateOverride = ""
@@ -29,9 +23,9 @@ struct PendingPhoto: Identifiable {
     var method: String
     let dpi: Int
     let scannerModel: String?
-    var savedURL: URL?
+    let savedURL: URL
     /// Where this crop sits on its scanned page — lets the crop be adjusted
-    /// by hand while that page's raw data is still around (the last scan).
+    /// by hand while that page's raw data is still in the cache.
     var pageIndex: Int?
     var sourceRect: CGRect?
 }
@@ -44,16 +38,29 @@ struct CropEditingContext: Identifiable {
     let rect: CGRect
 }
 
-/// UI state and orchestration. The kit's calls are all blocking, so scanner
-/// and pipeline work runs on `workQueue` (or the watch thread); @Published
-/// state is only touched on the main thread. A scan, a save and the watch
-/// loop are mutually exclusive via `busy`/`watching`.
+/// UI state and orchestration, split across files by concern:
+///  - ScanModel+Scanner — talking to the printer (discovery, scan, watch,
+///    the crop pipeline, re-process)
+///  - ScanModel+Photos — per-photo actions and the crop editor
+///  - ScanModel+Saving — writing JPEGs and the album file
+///  - ScanModel+Album — the output folder as a reopenable project
+///  - ScanModel+Cache — the original scanned pages kept on disk
 ///
+/// The kit's calls are all blocking, so scanner and pipeline work runs on
+/// `workQueue` (or the watch thread); @Published state is only touched on
+/// the main thread. A scan, a rewrite and the watch loop are mutually
+/// exclusive via `busy`/`watching`.
+///
+/// Every scan is written to the album folder as soon as it is processed —
+/// there is no unsaved state, and every edit rewrites the file in place.
 /// Settings persist in two places: app-level preferences (scan settings,
 /// author, last output folder) in UserDefaults, and per-album metadata
-/// (title, description, keywords, date) in a `.retroscan.json` file inside
-/// the output folder — written on save, loaded back when the folder is
-/// chosen again, so an album session resumes where it left off.
+/// (title, description, keywords, date, plus a record of every saved file
+/// and where it came from) in a `.retroscan.json` file inside the output
+/// folder. That file makes the folder a reopenable project: choosing it
+/// again reloads the metadata and the saved photos, whose crops stay
+/// adjustable for as long as their raw pages are in the cache — pages are
+/// only ever dropped by Delete Original Scans.
 final class ScanModel: ObservableObject {
     // Scanner
     @Published var scanners: [DiscoveredScanner] = []
@@ -64,7 +71,6 @@ final class ScanModel: ObservableObject {
     @Published var resolution = 300 { didSet { persistDefaults() } }
     @Published var grayscale = false { didSet { persistDefaults() } }
     @Published var crop: CropStrategy = .auto { didSet { persistDefaults() } }
-    @Published var useSAM = false { didSet { persistDefaults() } }
     @Published var autoRotate = true { didSet { persistDefaults() } }
     @Published var quality = 0.92 { didSet { persistDefaults() } }
 
@@ -82,33 +88,33 @@ final class ScanModel: ObservableObject {
             loadAlbumInfo(from: outputDirectory)
         }
     }
-    @Published var autoSave = false { didSet { persistDefaults() } }
 
     // Session
-    @Published var photos: [PendingPhoto] = []
+    @Published var photos: [AlbumPhoto] = []
     @Published var busy = false
     @Published var watching = false
     @Published var status = "Ready"
     @Published var errorMessage: String?
+    /// Total size of the cached raw pages — the disk cost of keeping every
+    /// crop adjustable. Recomputed alongside the cache manifest.
+    @Published var cacheBytes: Int64 = 0
 
     var dateTakenValid: Bool { dateTaken.isEmpty || ContentDate(dateTaken) != nil }
-    var unsavedCount: Int { photos.filter { $0.savedURL == nil }.count }
 
     /// didSet observers on wrapped properties fire even for the assignments
     /// inside init — keep them from writing half-loaded values back to
     /// UserDefaults until every preference has been read.
     private var restored = false
-    private let workQueue = DispatchQueue(label: "retroscan.work", qos: .userInitiated)
-    private var listener: PushScanListener?
-    private var sam: SAMDetector?
-    private var lastBatch: (id: UUID, pages: [Data], pageURLs: [URL], dpi: Int, model: String?)?
-    /// Raw pages kept on disk per batch, while any of its photos is unsaved.
-    private var batches: [UUID: SessionManifest.Batch] = [:]
-    /// Holds the spilled full-resolution PNGs, thumbnails and last-scan raw
-    /// pages of the unsaved session, plus its manifest — a stable location,
-    /// so quitting the app (or crashing) loses nothing: the pending grid is
-    /// restored on the next launch.
-    private let pendingDir = FileManager.default
+    let workQueue = DispatchQueue(label: "retroscan.work", qos: .userInitiated)
+    var listener: PushScanListener?
+    var lastBatch: (id: UUID, pages: [Data], pageURLs: [URL], dpi: Int, model: String?)?
+    /// Raw pages kept on disk per batch — for as long as the cache lives,
+    /// so any photo can have its crop re-adjusted from its source page.
+    /// Only Delete Original Scans drops them.
+    var batches: [UUID: CacheManifest.Batch] = [:]
+    /// Holds the cached raw pages and their manifest — a stable location
+    /// shared across launches.
+    let pendingDir = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("retroscan/pending", isDirectory: true)
 
@@ -124,20 +130,18 @@ final class ScanModel: ObservableObject {
         if let raw = d.string(forKey: "crop"), let strategy = CropStrategy(rawValue: raw) {
             crop = strategy
         }
-        useSAM = d.bool(forKey: "useSAM")
         if d.object(forKey: "autoRotate") != nil { autoRotate = d.bool(forKey: "autoRotate") }
         if d.object(forKey: "quality") != nil { quality = d.double(forKey: "quality") }
-        autoSave = d.bool(forKey: "autoSave")
         author = d.string(forKey: "author") ?? ""
 
         try? FileManager.default.createDirectory(at: pendingDir, withIntermediateDirectories: true)
         loadAlbumInfo(from: outputDirectory)
-        restoreSession()
+        restoreCache()
         restored = true
         refreshScanners()
     }
 
-    // MARK: - Persistence
+    // MARK: - App-level preferences
 
     private func persistDefaults() {
         guard restored else { return }
@@ -146,534 +150,27 @@ final class ScanModel: ObservableObject {
         d.set(resolution, forKey: "resolution")
         d.set(grayscale, forKey: "grayscale")
         d.set(crop.rawValue, forKey: "crop")
-        d.set(useSAM, forKey: "useSAM")
         d.set(autoRotate, forKey: "autoRotate")
         d.set(quality, forKey: "quality")
-        d.set(autoSave, forKey: "autoSave")
         d.set(author, forKey: "author")
     }
 
-    private struct AlbumInfo: Codable {
-        var title: String?
-        var description: String?
-        var author: String?
-        var keywords: String?
-        var dateTaken: String?
-        /// Per-file record of the overrides actually embedded at save time,
-        /// keyed by filename — a readable catalog of where a photo differs
-        /// from the album. Write-only: the JPEG's own EXIF/IPTC stays the
-        /// source of truth.
-        var files: [String: FileOverride]?
-    }
+    // MARK: - Shared helpers
 
-    private struct FileOverride: Codable {
-        var dateTaken: String?
-        var description: String?
-    }
-
-    private static let albumFileName = ".retroscan.json"
-
-    /// Fills the metadata fields from the folder's album file; a folder
-    /// without one starts a fresh album (author, an app-level preference,
-    /// is kept).
-    private func loadAlbumInfo(from dir: URL) {
-        let url = dir.appendingPathComponent(Self.albumFileName)
-        guard let data = try? Data(contentsOf: url),
-              let info = try? JSONDecoder().decode(AlbumInfo.self, from: data) else {
-            title = ""; caption = ""; keywords = ""; dateTaken = ""
-            return
-        }
-        title = info.title ?? ""
-        caption = info.description ?? ""
-        keywords = info.keywords ?? ""
-        dateTaken = info.dateTaken ?? ""
-        if let a = info.author, !a.isEmpty { author = a }
-    }
-
-    // MARK: - Session persistence (the unsaved grid survives a relaunch)
-
-    private struct SessionManifest: Codable {
-        struct Photo: Codable {
-            var id: UUID
-            var batch: UUID
-            var fileName: String
-            var thumbName: String
-            var quarterTurns: Int
-            var dateOverride: String
-            var captionOverride: String
-            var pixelWidth: Int
-            var pixelHeight: Int
-            var method: String
-            var dpi: Int
-            var scannerModel: String?
-            var pageIndex: Int?
-            var sourceRect: [Double]?
-        }
-        struct Batch: Codable {
-            var id: UUID
-            var pageNames: [String]
-            var dpi: Int
-            var model: String?
-        }
-        var photos: [Photo]
-        /// Every batch whose raw pages are still in the pending dir — kept
-        /// as long as one of its photos is unsaved, so any pending crop can
-        /// be re-adjusted from its source page.
-        var batches: [Batch]?
-        var lastBatchID: UUID?
-        /// Legacy single-batch field (pre-`batches` manifests).
-        var lastBatch: Batch?
-    }
-
-    private var manifestURL: URL { pendingDir.appendingPathComponent("manifest.json") }
-
-    /// Rewrites the manifest after any mutation of the pending set. The
-    /// image files themselves are already on disk (written at process
-    /// time), so this small JSON is all that a relaunch needs.
-    private func persistSession() {
-        let manifest = SessionManifest(
-            photos: photos.filter { $0.savedURL == nil }.map { photo in
-                SessionManifest.Photo(
-                    id: photo.id, batch: photo.batch,
-                    fileName: photo.fullResURL.lastPathComponent,
-                    thumbName: photo.thumbURL.lastPathComponent,
-                    quarterTurns: photo.quarterTurns,
-                    dateOverride: photo.dateOverride,
-                    captionOverride: photo.captionOverride,
-                    pixelWidth: photo.pixelWidth, pixelHeight: photo.pixelHeight,
-                    method: photo.method, dpi: photo.dpi,
-                    scannerModel: photo.scannerModel,
-                    pageIndex: photo.pageIndex,
-                    sourceRect: photo.sourceRect.map {
-                        [$0.minX, $0.minY, $0.width, $0.height]
-                    })
-            },
-            batches: Array(batches.values),
-            lastBatchID: lastBatch?.id)
-        if let data = try? JSONEncoder().encode(manifest) {
-            try? data.write(to: manifestURL)
-        }
-    }
-
-    /// Rebuilds the pending grid from the manifest. The stored thumbnail is
-    /// the unrotated one; the recorded quarter turns are re-applied to it.
-    private func restoreSession() {
-        guard let data = try? Data(contentsOf: manifestURL),
-              let manifest = try? JSONDecoder().decode(SessionManifest.self, from: data) else {
-            return
-        }
-        var referenced: Set<String> = ["manifest.json"]
-        for entry in manifest.photos {
-            let fullURL = pendingDir.appendingPathComponent(entry.fileName)
-            let thumbURL = pendingDir.appendingPathComponent(entry.thumbName)
-            guard FileManager.default.fileExists(atPath: fullURL.path),
-                  var thumbnail = loadImage(thumbURL) else { continue }
-            for _ in 0..<(entry.quarterTurns % 4) {
-                thumbnail = rotated(thumbnail, .right)
-            }
-            referenced.insert(entry.fileName)
-            referenced.insert(entry.thumbName)
-            photos.append(PendingPhoto(
-                id: entry.id, batch: entry.batch, thumbnail: thumbnail,
-                fullResURL: fullURL, thumbURL: thumbURL,
-                quarterTurns: entry.quarterTurns,
-                dateOverride: entry.dateOverride,
-                captionOverride: entry.captionOverride,
-                pixelWidth: entry.pixelWidth, pixelHeight: entry.pixelHeight,
-                method: entry.method, dpi: entry.dpi,
-                scannerModel: entry.scannerModel,
-                pageIndex: entry.pageIndex,
-                sourceRect: entry.sourceRect.flatMap {
-                    $0.count == 4 ? CGRect(x: $0[0], y: $0[1], width: $0[2], height: $0[3]) : nil
-                }))
-        }
-        let storedBatches = manifest.batches ?? manifest.lastBatch.map { [$0] } ?? []
-        for batch in storedBatches {
-            let present = batch.pageNames.allSatisfy {
-                FileManager.default.fileExists(atPath: pendingDir.appendingPathComponent($0).path)
-            }
-            guard present, !batch.pageNames.isEmpty else { continue }
-            batches[batch.id] = batch
-            batch.pageNames.forEach { referenced.insert($0) }
-        }
-        if let lastID = manifest.lastBatchID ?? manifest.lastBatch?.id,
-           let batch = batches[lastID] {
-            let urls = batch.pageNames.map { pendingDir.appendingPathComponent($0) }
-            let pages = urls.compactMap { try? Data(contentsOf: $0) }
-            if pages.count == urls.count {
-                lastBatch = (batch.id, pages, urls, batch.dpi, batch.model)
-            }
-        }
-        // Anything in the pending dir the manifest doesn't reference is a
-        // leftover (from a save interrupted mid-cleanup, say) — drop it.
-        let entries = (try? FileManager.default.contentsOfDirectory(atPath: pendingDir.path)) ?? []
-        for entry in entries where !referenced.contains(entry) {
-            try? FileManager.default.removeItem(at: pendingDir.appendingPathComponent(entry))
-        }
-        if !photos.isEmpty {
-            status = "Restored \(photos.count) unsaved photo\(photos.count > 1 ? "s" : "") from the previous session"
-        }
-    }
-
-    // MARK: - Discovery
-
-    func refreshScanners() {
-        guard !discovering else { return }
-        discovering = true
-        workQueue.async {
-            let found = discoverScanners()
-            DispatchQueue.main.async {
-                self.scanners = found
-                if self.selectedScanner == nil { self.selectedScanner = found.first?.name }
-                self.discovering = false
-            }
-        }
-    }
-
-    private func selectedEndpoint() -> (NWEndpoint, String?)? {
-        let scanner = scanners.first(where: { $0.name == selectedScanner }) ?? scanners.first
-        return scanner.map { ($0.endpoint, $0.name) }
-    }
-
-    // MARK: - One-shot scan
-
-    func scanOnce() {
-        guard !busy, !watching else { return }
-        guard let (endpoint, modelName) = selectedEndpoint() else {
-            errorMessage = "No scanner found — check the printer is on, then refresh."
-            return
-        }
-        busy = true
-        let settings = snapshotSettings()
-        workQueue.async {
-            do {
-                let sam = try self.prepareSAM(settings)
-                let (pages, dpi) = try self.scan(endpoint: endpoint, settings: settings)
-                try self.process(pages: pages, dpi: dpi, model: modelName, sam: sam, settings: settings)
-                DispatchQueue.main.async { self.busy = false; self.status = "Ready" }
-            } catch {
-                self.finish(with: error)
-            }
-        }
-    }
-
-    /// Runs the crop/rotate pipeline on an existing scan JPEG (the CLI's
-    /// --input): open a file with the app, or drop one on the grid, to
-    /// replay a scan without touching the scanner.
-    func processFile(_ url: URL) {
-        guard !busy else { return }
-        busy = true
-        status = "Processing \(url.lastPathComponent)…"
-        let settings = snapshotSettings()
-        workQueue.async {
-            do {
-                guard let data = try? Data(contentsOf: url) else {
-                    throw PipelineError.decodeFailed
-                }
-                let sam = try self.prepareSAM(settings)
-                try self.process(pages: [data], dpi: settings.resolution, model: nil,
-                                 sam: sam, settings: settings)
-                DispatchQueue.main.async { self.busy = false; self.status = "Ready" }
-            } catch {
-                self.finish(with: error)
-            }
-        }
-    }
-
-    // MARK: - Watch mode (printer's Scan button)
-
-    func toggleWatch() {
-        if watching {
-            status = "Stopping…"
-            listener?.stop()
-        } else {
-            startWatch()
-        }
-    }
-
-    private func startWatch() {
-        guard !busy, !watching else { return }
-        guard let (endpoint, modelName) = selectedEndpoint() else {
-            errorMessage = "No scanner found — check the printer is on, then refresh."
-            return
-        }
-        watching = true
-        status = "Registering on the printer…"
-        let settings = snapshotSettings()
-        let thread = Thread {
-            do {
-                let sam = try self.prepareSAM(settings)
-                let (printerIP, localIP) = try resolveAddresses(endpoint: endpoint)
-                let listener = PushScanListener(printerHost: printerIP, localIP: localIP,
-                                                displayName: "retroscan")
-                try listener.start()
-                DispatchQueue.main.async {
-                    self.listener = listener
-                    self.status = "Watching — press the printer's Scan button (Scan to PC > Image)"
-                }
-                while true {
-                    do {
-                        try listener.waitForButton()
-                    } catch let error as ScanError {
-                        if case .cancelled = error { break }
-                        throw error
-                    }
-                    // A failed scan (jam, cover open, busy) shouldn't end the
-                    // session: report it and keep listening, like the CLI.
-                    do {
-                        self.setStatus("Scan button pressed…")
-                        let (pages, dpi) = try self.scan(endpoint: endpoint, settings: settings)
-                        try self.process(pages: pages, dpi: dpi, model: modelName, sam: sam,
-                                         settings: settings)
-                        self.setStatus("Watching — ready for the next press")
-                    } catch {
-                        self.setStatus("\(error) — still watching")
-                        Thread.sleep(forTimeInterval: 3)
-                    }
-                }
-                DispatchQueue.main.async {
-                    self.listener = nil
-                    self.watching = false
-                    self.status = "Ready"
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.listener = nil
-                    self.watching = false
-                    self.status = "Ready"
-                    self.errorMessage = "\(error)"
-                }
-            }
-        }
-        thread.name = "retroscan.watch"
-        thread.start()
-    }
-
-    // MARK: - Per-photo actions
-
-    func remove(_ photo: PendingPhoto) {
-        photos.removeAll { $0.id == photo.id }
-        try? FileManager.default.removeItem(at: photo.fullResURL)
-        try? FileManager.default.removeItem(at: photo.thumbURL)
-        cleanupBatches()
-        persistSession()
-    }
-
-    /// 90° clockwise; only offered before saving, so preview and file agree.
-    /// The thumbnail turns immediately, the full-resolution image at save.
-    func rotate(_ photo: PendingPhoto) {
-        guard let i = photos.firstIndex(where: { $0.id == photo.id }) else { return }
-        photos[i].quarterTurns = (photos[i].quarterTurns + 1) % 4
-        photos[i].thumbnail = rotated(photos[i].thumbnail, .right)
-        (photos[i].pixelWidth, photos[i].pixelHeight) = (photos[i].pixelHeight, photos[i].pixelWidth)
-        persistSession()
-    }
-
-    /// Bindings into a photo's override fields for the per-photo popover.
-    func dateOverride(_ id: UUID) -> Binding<String> {
-        Binding(
-            get: { self.photos.first(where: { $0.id == id })?.dateOverride ?? "" },
-            set: { value in
-                if let i = self.photos.firstIndex(where: { $0.id == id }) {
-                    self.photos[i].dateOverride = value
-                    self.persistSession()
-                }
-            })
-    }
-
-    func captionOverride(_ id: UUID) -> Binding<String> {
-        Binding(
-            get: { self.photos.first(where: { $0.id == id })?.captionOverride ?? "" },
-            set: { value in
-                if let i = self.photos.firstIndex(where: { $0.id == id }) {
-                    self.photos[i].captionOverride = value
-                    self.persistSession()
-                }
-            })
-    }
-
-    /// A crop is adjustable while the photo is unsaved and its source page
-    /// is still in the pending dir — pages are kept per batch until every
-    /// photo of the batch is saved or discarded.
-    func canEditCrop(_ photo: PendingPhoto) -> Bool {
-        photo.savedURL == nil && photo.sourceRect != nil
-            && photo.pageIndex != nil && batches[photo.batch] != nil
-    }
-
-    /// Decodes the photo's source page for the crop editor sheet.
-    func beginCropEdit(_ photo: PendingPhoto) -> CropEditingContext? {
-        guard canEditCrop(photo),
-              let index = photo.pageIndex, let rect = photo.sourceRect else { return nil }
-        let pageData: Data
-        if let last = lastBatch, last.id == photo.batch, index < last.pages.count {
-            pageData = last.pages[index]
-        } else if let batch = batches[photo.batch], index < batch.pageNames.count,
-                  let data = try? Data(contentsOf:
-                      pendingDir.appendingPathComponent(batch.pageNames[index])) {
-            pageData = data
-        } else {
-            return nil
-        }
-        guard let source = CGImageSourceCreateWithData(pageData as CFData, nil),
-              let page = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
-        return CropEditingContext(id: photo.id, page: page, rect: rect)
-    }
-
-    /// Replaces the photo with a plain crop of the adjusted rectangle. The
-    /// manual frame is taken literally (no tightening); the photo's rotation
-    /// is kept, since it lives in quarterTurns, not in the stored image.
-    func applyCropEdit(photoID: UUID, page: CGImage, rect: CGRect) {
-        guard let i = photos.firstIndex(where: { $0.id == photoID }) else { return }
-        let bounded = rect.integral.intersection(
-            CGRect(x: 0, y: 0, width: page.width, height: page.height))
-        guard bounded.width >= 20, bounded.height >= 20,
-              let image = page.cropping(to: bounded) else { return }
-        let old = photos[i]
-        workQueue.async {
-            do {
-                let name = UUID().uuidString
-                let fullURL = self.pendingDir.appendingPathComponent("\(name).png")
-                let thumbURL = self.pendingDir.appendingPathComponent("\(name)-thumb.png")
-                try self.writePNG(image, to: fullURL)
-                var thumbnail = self.downscaled(image, maxDim: 640) ?? image
-                try self.writePNG(thumbnail, to: thumbURL)
-                for _ in 0..<(old.quarterTurns % 4) { thumbnail = rotated(thumbnail, .right) }
-                DispatchQueue.main.async {
-                    guard let i = self.photos.firstIndex(where: { $0.id == photoID }) else { return }
-                    try? FileManager.default.removeItem(at: old.fullResURL)
-                    try? FileManager.default.removeItem(at: old.thumbURL)
-                    let photo = self.photos[i]
-                    let upright = photo.quarterTurns % 2 == 1
-                    self.photos[i] = PendingPhoto(
-                        id: photo.id, batch: photo.batch,
-                        thumbnail: thumbnail,
-                        fullResURL: fullURL, thumbURL: thumbURL,
-                        quarterTurns: photo.quarterTurns,
-                        dateOverride: photo.dateOverride,
-                        captionOverride: photo.captionOverride,
-                        pixelWidth: upright ? image.height : image.width,
-                        pixelHeight: upright ? image.width : image.height,
-                        method: "manual", dpi: photo.dpi,
-                        scannerModel: photo.scannerModel,
-                        pageIndex: photo.pageIndex,
-                        sourceRect: bounded)
-                    self.persistSession()
-                }
-            } catch {
-                self.finish(with: error)
-            }
-        }
-    }
-
-    func clearAll() {
-        for photo in photos {
-            try? FileManager.default.removeItem(at: photo.fullResURL)
-            try? FileManager.default.removeItem(at: photo.thumbURL)
-        }
-        photos.removeAll()
-        for batch in batches.values {
-            for name in batch.pageNames {
-                try? FileManager.default.removeItem(at: pendingDir.appendingPathComponent(name))
-            }
-        }
-        batches.removeAll()
-        lastBatch = nil
-        persistSession()
-    }
-
-    /// Re-runs crop/rotate with the current settings on the last scan's raw
-    /// pages — no need to rescan to try another strategy or toggle SAM.
-    /// Photos from that scan already saved to disk are left alone.
-    func reprocessLastScan() {
-        guard !busy, !watching, let last = lastBatch else { return }
-        busy = true
-        let settings = snapshotSettings()
-        workQueue.async {
-            do {
-                let sam = try self.prepareSAM(settings)
-                DispatchQueue.main.async {
-                    let dropped = self.photos.filter { $0.batch == last.id && $0.savedURL == nil }
-                    self.photos.removeAll { $0.batch == last.id && $0.savedURL == nil }
-                    for photo in dropped {
-                        try? FileManager.default.removeItem(at: photo.fullResURL)
-                        try? FileManager.default.removeItem(at: photo.thumbURL)
-                    }
-                }
-                try self.process(pages: last.pages, dpi: last.dpi, model: last.model,
-                                 sam: sam, settings: settings)
-                DispatchQueue.main.async { self.busy = false; self.status = "Ready" }
-            } catch {
-                self.finish(with: error)
-            }
-        }
-    }
-
-    var canReprocess: Bool { lastBatch != nil && !busy && !watching }
-
-    // MARK: - Saving
-
-    /// Opens the output folder in the Finder (creating it if needed, so the
-    /// button works before the first save).
-    func revealOutputFolder() {
-        try? FileManager.default.createDirectory(at: outputDirectory,
-                                                 withIntermediateDirectories: true)
-        NSWorkspace.shared.open(outputDirectory)
-    }
-
-    func chooseOutputDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.canCreateDirectories = true
-        panel.directoryURL = outputDirectory
-        panel.prompt = "Choose"
-        if panel.runModal() == .OK, let url = panel.url {
-            outputDirectory = url
-        }
-    }
-
-    func saveAll() {
-        guard !busy, unsavedCount > 0 else { return }
-        busy = true
-        status = "Saving…"
-        let settings = snapshotSettings()
-        var copy = photos
-        workQueue.async {
-            do {
-                try self.save(&copy, settings: settings)
-                DispatchQueue.main.async {
-                    for saved in copy {
-                        if let i = self.photos.firstIndex(where: { $0.id == saved.id }) {
-                            self.photos[i].savedURL = saved.savedURL
-                        }
-                    }
-                    self.cleanupBatches()
-                    self.persistSession()
-                    self.busy = false
-                    self.status = "Saved to \(settings.outDir.path)"
-                }
-            } catch {
-                self.finish(with: error)
-            }
-        }
-    }
-
-    // MARK: - Background helpers (workQueue / watch thread only)
-
-    private struct Settings {
+    /// An immutable copy of everything the background work needs, taken on
+    /// the main thread before hopping to workQueue.
+    struct Settings {
         var resolution: Int
         var grayscale: Bool
         var crop: CropStrategy
-        var useSAM: Bool
         var autoRotate: Bool
         var metadata: ImageMetadata
         var outDir: URL
-        var autoSave: Bool
         var baseName: String
         var album: AlbumInfo
     }
 
-    private func snapshotSettings() -> Settings {
+    func snapshotSettings() -> Settings {
         let keywordList = keywords.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
@@ -693,227 +190,21 @@ final class ScanModel: ObservableObject {
             keywords: keywords.isEmpty ? nil : keywords,
             dateTaken: dateTaken.isEmpty ? nil : dateTaken)
         return Settings(resolution: resolution, grayscale: grayscale, crop: crop,
-                        useSAM: useSAM, autoRotate: autoRotate, metadata: metadata,
-                        outDir: outputDirectory, autoSave: autoSave,
+                        autoRotate: autoRotate, metadata: metadata,
+                        outDir: outputDirectory,
                         baseName: base.isEmpty ? "scan" : base,
                         album: album)
     }
 
-    private func setStatus(_ text: String) {
+    func setStatus(_ text: String) {
         DispatchQueue.main.async { self.status = text }
     }
 
-    private func finish(with error: Error) {
+    func finish(with error: Error) {
         DispatchQueue.main.async {
             self.busy = false
             self.status = "Ready"
             self.errorMessage = "\(error)"
         }
-    }
-
-    private func prepareSAM(_ settings: Settings) throws -> SAMDetector? {
-        guard settings.useSAM, settings.crop == .auto || settings.crop == .photos else { return nil }
-        if let sam { return sam }
-        if !SAMDetector.modelsPresent() {
-            try SAMDetector.downloadModels { self.setStatus($0) }
-        }
-        let sam = try SAMDetector()
-        self.sam = sam
-        return sam
-    }
-
-    private func scan(endpoint: NWEndpoint, settings: Settings) throws -> ([Data], Int) {
-        let client = BrotherScanClient(endpoint: endpoint)
-        defer { client.close() }
-        try client.connect()
-        let caps = try client.queryCapabilities(resolution: settings.resolution, mode: .color)
-        setStatus("Scanning \(caps.widthMM)×\(caps.heightMM) mm at \(caps.resolutionX) dpi…")
-        var lastReported = 0
-        let pages = try client.scan(capabilities: caps, mode: .color) { page, bytes in
-            if bytes - lastReported > 512 * 1024 {
-                lastReported = bytes
-                self.setStatus("Scanning… page \(page): \(bytes / 1024) KB")
-            }
-        }
-        guard !pages.isEmpty else { throw ScanError.deviceError("scanner returned no data") }
-        return (pages, caps.resolutionX)
-    }
-
-    private func process(pages: [Data], dpi: Int, model: String?, sam: SAMDetector?,
-                         settings: Settings) throws {
-        setStatus("Processing…")
-        let batchID = UUID()
-        var newPhotos: [PendingPhoto] = []
-        for (pageIndex, page) in pages.enumerated() {
-            for cropped in try extractImages(from: page, crop: settings.crop, sam: sam) {
-                var image = cropped.image
-                var method = cropped.method
-                // Rotation is never baked into the stored image: it lives in
-                // quarterTurns (auto-rotation seeds it, the rotate button
-                // adjusts it), applied to the thumbnail for display and to
-                // the full image at save. The spill stays in page
-                // orientation, so a re-crop composes with rotation instead
-                // of losing it.
-                var turns = 0
-                if settings.autoRotate, let o = detectUprightOrientation(image), o != .up {
-                    turns = quarterTurns(for: o)
-                    method += ", rotated \(degrees(o))°"
-                }
-                if settings.grayscale, let gray = convertToGrayscale(image) {
-                    image = gray
-                }
-                let name = UUID().uuidString
-                let fullURL = pendingDir.appendingPathComponent("\(name).png")
-                let thumbURL = pendingDir.appendingPathComponent("\(name)-thumb.png")
-                try writePNG(image, to: fullURL)
-                var thumbnail = downscaled(image, maxDim: 640) ?? image
-                try writePNG(thumbnail, to: thumbURL)
-                for _ in 0..<turns { thumbnail = rotated(thumbnail, .right) }
-                let upright = turns % 2 == 1
-                newPhotos.append(PendingPhoto(batch: batchID, thumbnail: thumbnail,
-                                              fullResURL: fullURL, thumbURL: thumbURL,
-                                              quarterTurns: turns,
-                                              pixelWidth: upright ? image.height : image.width,
-                                              pixelHeight: upright ? image.width : image.height,
-                                              method: method, dpi: dpi, scannerModel: model,
-                                              pageIndex: pageIndex,
-                                              sourceRect: cropped.sourceRect))
-            }
-        }
-        // The raw pages are spilled too, so Re-process still works after a
-        // relaunch.
-        var pageURLs: [URL] = []
-        for (n, page) in pages.enumerated() {
-            let url = pendingDir.appendingPathComponent("\(batchID.uuidString)-p\(n).jpg")
-            try? page.write(to: url)
-            pageURLs.append(url)
-        }
-        if settings.autoSave {
-            try save(&newPhotos, settings: settings)
-        }
-        DispatchQueue.main.async {
-            self.lastBatch = (batchID, pages, pageURLs, dpi, model)
-            self.batches[batchID] = SessionManifest.Batch(
-                id: batchID, pageNames: pageURLs.map(\.lastPathComponent),
-                dpi: dpi, model: model)
-            self.photos.append(contentsOf: newPhotos)
-            self.cleanupBatches()
-            self.persistSession()
-        }
-    }
-
-    /// Drops the raw pages of batches nothing pending references any more
-    /// (the last batch is kept regardless, for Re-process).
-    private func cleanupBatches() {
-        let live = Set(photos.filter { $0.savedURL == nil }.map(\.batch))
-        for (id, batch) in batches where id != lastBatch?.id && !live.contains(id) {
-            for name in batch.pageNames {
-                try? FileManager.default.removeItem(at: pendingDir.appendingPathComponent(name))
-            }
-            batches.removeValue(forKey: id)
-        }
-    }
-
-    /// Writes every unsaved photo as "<base>-N.jpg", numbering continuing
-    /// from whatever already exists in the folder (same rule as the CLI),
-    /// then records the album metadata alongside them.
-    private func save(_ toSave: inout [PendingPhoto], settings: Settings) throws {
-        try FileManager.default.createDirectory(at: settings.outDir,
-                                                withIntermediateDirectories: true)
-        var next = nextFreeIndex(in: settings.outDir, base: settings.baseName)
-        var recorded: [String: FileOverride] = [:]
-        for i in toSave.indices where toSave[i].savedURL == nil {
-            guard var image = loadImage(toSave[i].fullResURL) else {
-                throw PipelineError.decodeFailed
-            }
-            switch toSave[i].quarterTurns {
-            case 1: image = rotated(image, .right)
-            case 2: image = rotated(image, .down)
-            case 3: image = rotated(image, .left)
-            default: break
-            }
-            let url = settings.outDir.appendingPathComponent("\(settings.baseName)-\(next).jpg")
-            var metadata = settings.metadata
-            metadata.scannerModel = toSave[i].scannerModel
-            metadata.dpi = toSave[i].dpi
-            // Per-photo overrides win over the album values.
-            var applied = FileOverride()
-            if let date = ContentDate(toSave[i].dateOverride) {
-                metadata.contentDate = date
-                applied.dateTaken = toSave[i].dateOverride
-            }
-            if !toSave[i].captionOverride.isEmpty {
-                metadata.description = toSave[i].captionOverride
-                applied.description = toSave[i].captionOverride
-            }
-            try writeJPEG(image: image, metadata: metadata, to: url)
-            if applied.dateTaken != nil || applied.description != nil {
-                recorded[url.lastPathComponent] = applied
-            }
-            toSave[i].savedURL = url
-            try? FileManager.default.removeItem(at: toSave[i].fullResURL)
-            try? FileManager.default.removeItem(at: toSave[i].thumbURL)
-            next += 1
-        }
-
-        // The album file: current album values, plus the per-file override
-        // records accumulated across saves (earlier entries are kept).
-        var album = settings.album
-        let albumURL = settings.outDir.appendingPathComponent(Self.albumFileName)
-        if let data = try? Data(contentsOf: albumURL),
-           let existing = try? JSONDecoder().decode(AlbumInfo.self, from: data) {
-            album.files = existing.files
-        }
-        if !recorded.isEmpty {
-            album.files = (album.files ?? [:]).merging(recorded) { _, new in new }
-        }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(album) {
-            try? data.write(to: albumURL)
-        }
-    }
-
-    private func quarterTurns(for orientation: CGImagePropertyOrientation) -> Int {
-        switch orientation {
-        case .right: return 1
-        case .down: return 2
-        case .left: return 3
-        default: return 0
-        }
-    }
-
-    // MARK: - Image spill helpers
-
-    private func writePNG(_ image: CGImage, to url: URL) throws {
-        guard let dest = CGImageDestinationCreateWithURL(
-                url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
-            throw PipelineError.encodeFailed(url.path)
-        }
-        CGImageDestinationAddImage(dest, image, nil)
-        guard CGImageDestinationFinalize(dest) else {
-            throw PipelineError.encodeFailed(url.path)
-        }
-    }
-
-    private func loadImage(_ url: URL) -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        return CGImageSourceCreateImageAtIndex(source, 0, nil)
-    }
-
-    private func downscaled(_ image: CGImage, maxDim: Int) -> CGImage? {
-        let scale = min(1.0, Double(maxDim) / Double(max(image.width, image.height)))
-        guard scale < 1.0 else { return image }
-        let w = max(1, Int(Double(image.width) * scale))
-        let h = max(1, Int(Double(image.height) * scale))
-        guard let ctx = CGContext(data: nil, width: w, height: h,
-                                  bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-            return nil
-        }
-        ctx.interpolationQuality = .high
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-        return ctx.makeImage()
     }
 }

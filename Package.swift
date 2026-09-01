@@ -5,7 +5,7 @@ let package = Package(
     name: "retroscan",
     platforms: [.macOS(.v13)],
     targets: [
-        // Scanner protocol, discovery, crop/rotate/metadata pipeline, SAM.
+        // Scanner protocol, discovery, crop/rotate/metadata pipeline.
         .target(name: "RetroscanKit", path: "Sources/RetroscanKit"),
         // Command-line interface.
         .executableTarget(

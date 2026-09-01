@@ -32,11 +32,6 @@ OUTPUT
   -q, --quality <0-1>    JPEG quality                     (default: 0.92)
 
 CROP
-  --sam                  Use Segment Anything (SAM 2) on the Neural Engine
-                         for photo detection on this run. Downloads the Core
-                         ML models (~78 MB) on first use. Helps when a photo
-                         edge is nearly white (washed-out sky, white cloth);
-                         the default classical detection is usually tighter
   -c, --crop <strategy>  auto | document | photos | trim | none   (default: auto)
                          auto: several photos on the bed -> one file each;
                          single document -> perspective crop; else trim borders
@@ -79,7 +74,6 @@ struct Options {
     var outDir = FileManager.default.currentDirectoryPath
     var baseName: String?
     var crop = CropStrategy.auto
-    var sam: Bool?  // nil = auto (use when models are installed)
     var rotate = RotateOption.auto
     var quality = 0.92
     var title: String?
@@ -125,8 +119,6 @@ func parseOptions() -> Options {
                 fail("quality must be in (0, 1]")
             }
             opts.quality = q
-        case "--sam": opts.sam = true
-        case "--no-sam": opts.sam = false
         case "-c", "--crop":
             guard let c = CropStrategy(rawValue: value(for: arg)) else {
                 fail("crop must be auto, document, photos, trim or none")
@@ -233,27 +225,7 @@ func resolveScanner() -> (NWEndpoint, String?) {
     return (chosen.endpoint, chosen.name)
 }
 
-// SAM (Segment Anything on the Neural Engine) is opt-in per run: the
-// classical detection usually crops tighter, SAM helps on photos whose
-// edges are nearly white. Models are downloaded once and cached.
-func makeSAM() -> SAMDetector? {
-    guard opts.sam == true, opts.crop == .auto || opts.crop == .photos else { return nil }
-    if !SAMDetector.modelsPresent() {
-        do {
-            try SAMDetector.downloadModels { print("  \($0)") }
-        } catch {
-            fail("could not download SAM models: \(error)")
-        }
-    }
-    do {
-        return try SAMDetector()
-    } catch {
-        FileHandle.standardError.write(Data("warning: SAM unavailable (\(error)), using classical detection\n".utf8))
-        return nil
-    }
-}
-
-func processAndSave(pages: [Data], dpi: Int, modelName: String?, sam: SAMDetector?) throws {
+func processAndSave(pages: [Data], dpi: Int, modelName: String?) throws {
     let dirURL = URL(fileURLWithPath: opts.outDir, isDirectory: true)
     try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
@@ -264,7 +236,7 @@ func processAndSave(pages: [Data], dpi: Int, modelName: String?, sam: SAMDetecto
 
     var images: [CroppedImage] = []
     for jpeg in pages {
-        images.append(contentsOf: try extractImages(from: jpeg, crop: opts.crop, sam: sam))
+        images.append(contentsOf: try extractImages(from: jpeg, crop: opts.crop))
     }
 
     // With --name or --title the files are "<base>-1.jpg", "<base>-2.jpg", …
@@ -330,7 +302,6 @@ if opts.watch {
     } catch {
         fail("\(error)")
     }
-    let sam = makeSAM()
     let listener = PushScanListener(printerHost: printerIP, localIP: localIP,
                                     displayName: "retroscan")
     do {
@@ -345,7 +316,7 @@ if opts.watch {
             try listener.waitForButton()
             print("Scan button pressed…")
             let (pages, dpi, model) = try scanFromScanner(endpoint: endpoint, modelName: modelName)
-            try processAndSave(pages: pages, dpi: dpi, modelName: model, sam: sam)
+            try processAndSave(pages: pages, dpi: dpi, modelName: model)
             print("Ready for the next press.")
         } catch {
             FileHandle.standardError.write(Data("retroscan: \(error) — still watching\n".utf8))
@@ -355,7 +326,7 @@ if opts.watch {
 } else {
     let (pages, dpi, modelName) = acquirePages()
     do {
-        try processAndSave(pages: pages, dpi: dpi, modelName: modelName, sam: makeSAM())
+        try processAndSave(pages: pages, dpi: dpi, modelName: modelName)
     } catch {
         fail("\(error)")
     }
