@@ -10,48 +10,61 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 380)
         } detail: {
             PhotoGrid()
-                .safeAreaInset(edge: .bottom, spacing: 0) { StatusBar() }
         }
         .frame(minWidth: 900, minHeight: 560)
         .toolbar {
-            ToolbarItemGroup {
+            // Scan is the one thing this app is for, so it is the only
+            // accent-tinted control; Watch turns solid red while it is live,
+            // the way a recording control does. Everything rarer lives in
+            // the overflow menu.
+            ToolbarItemGroup(placement: .primaryAction) {
                 Button {
                     model.scanOnce()
                 } label: {
                     Label("Scan", systemImage: "scanner")
                         .labelStyle(.titleAndIcon)
                 }
+                .buttonStyle(.borderedProminent)
                 .disabled(model.busy || model.watching)
                 .help("Scan now")
 
                 Button {
                     model.toggleWatch()
                 } label: {
-                    Label(model.watching ? "Stop watching" : "Watch",
-                          systemImage: "dot.radiowaves.left.and.right")
+                    Label(model.watching ? "Stop" : "Watch",
+                          systemImage: model.watching
+                              ? "stop.circle.fill" : "dot.radiowaves.left.and.right")
                         .labelStyle(.titleAndIcon)
-                        .foregroundStyle(model.watching ? Color.red : Color.primary)
                 }
+                .buttonStyle(.bordered)
+                .tint(model.watching ? .red : nil)
                 .disabled(model.busy)
-                .help("Register on the printer's Scan to PC menu and scan on each button press")
+                .help(model.watching
+                      ? "Stop listening for the printer's Scan button"
+                      : "Register on the printer's Scan to PC menu and scan on each button press")
 
-                Button {
-                    model.reprocessLastScan()
-                } label: {
-                    Label("Re-process", systemImage: "arrow.triangle.2.circlepath")
-                        .labelStyle(.titleAndIcon)
-                }
-                .disabled(!model.canReprocess)
-                .help("Re-run cropping on the last scan with the current settings — no rescan")
+                Menu {
+                    Button {
+                        model.reprocessLastScan()
+                    } label: {
+                        Label("Re-process Last Scan", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .disabled(!model.canReprocess)
+                    .help("Re-run cropping on the last scan with the current settings — no rescan")
 
-                Button {
-                    model.clearAll()
+                    Divider()
+
+                    Button(role: .destructive) {
+                        model.clearAll()
+                    } label: {
+                        Label("Clear Grid", systemImage: "xmark.bin")
+                    }
+                    .disabled(model.photos.isEmpty || model.busy)
                 } label: {
-                    Label("Clear Grid", systemImage: "xmark.bin")
-                        .labelStyle(.titleAndIcon)
+                    Label("More", systemImage: "ellipsis.circle")
                 }
-                .disabled(model.photos.isEmpty || model.busy)
-                .help("Remove every photo from the grid — files on disk and original scans are kept; open the album to bring them back")
+                .menuIndicator(.hidden)
+                .help("Re-process the last scan, or clear the grid")
             }
         }
         .alert("retroscan", isPresented: Binding(
@@ -73,7 +86,7 @@ struct SettingsPane: View {
 
     var body: some View {
         Form {
-            Section("Scanner") {
+            Section {
                 Picker("Device", selection: $model.selectedScanner) {
                     if model.scanners.isEmpty {
                         Text(model.discovering ? "Searching…" : "None found")
@@ -93,9 +106,11 @@ struct SettingsPane: View {
                     }
                 }
                 .disabled(model.discovering)
+            } header: {
+                SectionLabel("Scanner", "printer.fill", .blue)
             }
 
-            Section("Scan") {
+            Section {
                 Picker("Resolution", selection: $model.resolution) {
                     ForEach([100, 150, 200, 300, 600], id: \.self) { dpi in
                         Text("\(dpi) dpi").tag(dpi)
@@ -104,6 +119,8 @@ struct SettingsPane: View {
                 Toggle("Grayscale", isOn: $model.grayscale)
                 Toggle("Crop to one file per photo", isOn: $model.splitPhotos)
                 Toggle("Auto-rotate (faces upright)", isOn: $model.autoRotate)
+            } header: {
+                SectionLabel("Scan", "doc.viewfinder.fill", .indigo)
             }
 
             Section {
@@ -133,13 +150,13 @@ struct SettingsPane: View {
                         .foregroundStyle(.red)
                 }
             } header: {
-                Text("Album")
+                SectionLabel("Album", "photo.stack.fill", .orange)
             } footer: {
                 Text("An album is a folder of saved photos. Open it again anytime: its photos come back, still croppable and editable.")
                     .foregroundStyle(.secondary)
             }
 
-            Section("Saving") {
+            Section {
                 LabeledContent("JPEG quality") {
                     Text("\(Int((model.quality * 100).rounded())) %")
                         .foregroundStyle(.secondary)
@@ -148,9 +165,11 @@ struct SettingsPane: View {
                     Text("JPEG quality")
                 }
                 .labelsHidden()
+            } header: {
+                SectionLabel("Saving", "square.and.arrow.down.fill", .green)
             }
 
-            Section("Original Scans") {
+            Section {
                 LabeledContent("Disk space", value: model.cacheSizeText)
                     .help("Every scanned page is kept so photo crops stay adjustable — even after saving")
                 Button("Delete Original Scans…") {
@@ -163,9 +182,33 @@ struct SettingsPane: View {
                 } message: {
                     Text("Photos keep their current crop and saved files stay on disk, but crops can no longer be re-adjusted.")
                 }
+            } header: {
+                SectionLabel("Original Scans", "internaldrive.fill", .gray)
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// A section header with a tinted symbol — the colour is what makes the
+/// sidebar scannable, so only the symbol takes it, never the title.
+struct SectionLabel: View {
+    let title: String
+    let symbol: String
+    let tint: Color
+
+    init(_ title: String, _ symbol: String, _ tint: Color) {
+        self.title = title
+        self.symbol = symbol
+        self.tint = tint
+    }
+
+    var body: some View {
+        Label {
+            Text(title)
+        } icon: {
+            Image(systemName: symbol).foregroundStyle(tint)
+        }
     }
 }
 
@@ -176,7 +219,7 @@ struct PhotoGrid: View {
 
     var body: some View {
         Group {
-            if model.photos.isEmpty {
+            if model.photos.isEmpty && !model.scanning {
                 VStack(spacing: 10) {
                     Image(systemName: "photo.on.rectangle.angled")
                         .font(.system(size: 44))
@@ -194,6 +237,11 @@ struct PhotoGrid: View {
                               spacing: 16) {
                         ForEach(model.photos) { photo in
                             PhotoCell(photo: photo)
+                        }
+                        // New photos are appended, so the placeholder sits
+                        // exactly where they are about to land.
+                        if model.scanning {
+                            ScanningCell(status: model.status)
                         }
                     }
                     .padding(16)
@@ -494,30 +542,29 @@ struct CropEditorView: View {
     }
 }
 
-// MARK: - Status bar
+// MARK: - Scan in progress
 
-struct StatusBar: View {
-    @EnvironmentObject var model: ScanModel
+/// Stands in for the photos a running scan is about to produce: a photo-sized
+/// frame with the spinner inside and the scanner's own progress as its caption
+/// ("Scanning… page 1: 512 KB"), so the feedback is where the result will be.
+struct ScanningCell: View {
+    let status: String
 
     var body: some View {
-        HStack(spacing: 8) {
-            if model.busy || model.watching {
-                ProgressView()
-                    .controlSize(.small)
-            }
-            Text(model.status)
-                .font(.callout)
+        VStack(spacing: 6) {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(.quaternary)
+                .aspectRatio(3.0 / 4.0, contentMode: .fit)
+                .frame(maxHeight: 240)
+                .overlay {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            Text(status.isEmpty ? "Scanning…" : status)
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-            Spacer()
-            if !model.photos.isEmpty {
-                Text("\(model.photos.count) photo\(model.photos.count > 1 ? "s" : "")")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
+                .truncationMode(.tail)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(.bar)
     }
 }

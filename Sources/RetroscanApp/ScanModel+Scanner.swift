@@ -36,12 +36,13 @@ extension ScanModel {
             return
         }
         busy = true
+        scanning = true
         let settings = snapshotSettings()
         workQueue.async {
             do {
                 let (pages, dpi) = try self.scan(endpoint: endpoint, settings: settings)
                 try self.process(pages: pages, dpi: dpi, model: modelName, settings: settings)
-                DispatchQueue.main.async { self.busy = false; self.status = "Ready" }
+                DispatchQueue.main.async { self.busy = false; self.scanning = false; self.status = "" }
             } catch {
                 self.finish(with: error)
             }
@@ -54,6 +55,7 @@ extension ScanModel {
     func processFile(_ url: URL) {
         guard !busy else { return }
         busy = true
+        scanning = true
         status = "Processing \(url.lastPathComponent)…"
         let settings = snapshotSettings()
         workQueue.async {
@@ -63,7 +65,7 @@ extension ScanModel {
                 }
                 try self.process(pages: [data], dpi: settings.resolution, model: nil,
                                  settings: settings)
-                DispatchQueue.main.async { self.busy = false; self.status = "Ready" }
+                DispatchQueue.main.async { self.busy = false; self.scanning = false; self.status = "" }
             } catch {
                 self.finish(with: error)
             }
@@ -110,6 +112,7 @@ extension ScanModel {
                     // A failed scan (jam, cover open, busy) shouldn't end the
                     // session: report it and keep listening, like the CLI.
                     do {
+                        DispatchQueue.main.async { self.scanning = true }
                         self.setStatus("Scan button pressed…")
                         let (pages, dpi) = try self.scan(endpoint: endpoint, settings: settings)
                         // Hop to workQueue so file writes (JPEGs, album
@@ -118,8 +121,10 @@ extension ScanModel {
                             try self.process(pages: pages, dpi: dpi, model: modelName,
                                              settings: settings)
                         }
+                        DispatchQueue.main.async { self.scanning = false }
                         self.setStatus("Watching — ready for the next press")
                     } catch {
+                        DispatchQueue.main.async { self.scanning = false }
                         self.setStatus("\(error) — still watching")
                         Thread.sleep(forTimeInterval: 3)
                     }
@@ -127,13 +132,13 @@ extension ScanModel {
                 DispatchQueue.main.async {
                     self.listener = nil
                     self.watching = false
-                    self.status = "Ready"
+                    self.status = ""
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.listener = nil
                     self.watching = false
-                    self.status = "Ready"
+                    self.status = ""
                     self.errorMessage = "\(error)"
                 }
             }
@@ -150,6 +155,7 @@ extension ScanModel {
     func reprocessLastScan() {
         guard !busy, !watching, let last = lastBatch else { return }
         busy = true
+        scanning = true
         let settings = snapshotSettings()
         let dropped = photos.filter { $0.batch == last.id }
         photos.removeAll { $0.batch == last.id }
@@ -163,7 +169,7 @@ extension ScanModel {
                 try self.process(pages: last.pages, dpi: last.dpi, model: last.model,
                                  settings: settings,
                                  existingBatch: (last.id, last.pageURLs))
-                DispatchQueue.main.async { self.busy = false; self.status = "Ready" }
+                DispatchQueue.main.async { self.busy = false; self.scanning = false; self.status = "" }
             } catch {
                 self.finish(with: error)
             }

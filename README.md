@@ -34,7 +34,7 @@ make check       # self-check the crop pipeline on synthetic pages (no scanner)
 
 ## 🖥️ The app
 
-![Retroscan.app: the album grid with two cropped photos](docs/app.png)
+![Retroscan.app: the settings sidebar and the album grid](docs/app.png)
 
 `make app` installs **Retroscan.app**, a SwiftUI front-end to the same
 engine (both are thin layers over the `RetroscanKit` library target):

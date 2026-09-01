@@ -95,7 +95,13 @@ final class ScanModel: ObservableObject {
     @Published var photos: [AlbumPhoto] = []
     @Published var busy = false
     @Published var watching = false
-    @Published var status = "Ready"
+    /// A scan is being acquired or processed, so the grid shows a placeholder
+    /// where the photos are about to land. Narrower than `busy`, which also
+    /// covers rewriting a photo that already exists.
+    @Published var scanning = false
+    /// What the status bar shows; empty means idle, and the bar stays blank
+    /// rather than announcing that nothing is happening.
+    @Published var status = ""
     @Published var errorMessage: String?
     /// Total size of the cached raw pages — the disk cost of keeping every
     /// crop adjustable. Recomputed alongside the cache manifest.
@@ -212,7 +218,8 @@ final class ScanModel: ObservableObject {
     func finish(with error: Error) {
         DispatchQueue.main.async {
             self.busy = false
-            self.status = "Ready"
+            self.scanning = false
+            self.status = ""
             self.errorMessage = "\(error)"
         }
     }
